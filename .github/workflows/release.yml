@@ -1,0 +1,39 @@
+name: Release
+
+# Builds release binaries for macOS + Linux on a v* tag and uploads them to the
+# GitHub release. NOTE: untested without a real tag push — treat as a starting point.
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+          - target: aarch64-apple-darwin
+            os: macos-latest
+          - target: x86_64-apple-darwin
+            os: macos-13
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - name: build
+        run: cargo build --release --locked --target ${{ matrix.target }}
+      - name: package
+        run: |
+          tar -C target/${{ matrix.target }}/release -czf \
+            busbarctl-${{ github.ref_name }}-${{ matrix.target }}.tar.gz busbarctl
+      - name: upload
+        uses: softprops/action-gh-release@v2
+        with:
+          files: busbarctl-${{ github.ref_name }}-${{ matrix.target }}.tar.gz
