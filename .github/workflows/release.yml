@@ -32,8 +32,8 @@ jobs:
       - name: package
         run: |
           tar -C target/${{ matrix.target }}/release -czf \
-            busbarctl-${{ github.ref_name }}-${{ matrix.target }}.tar.gz busbarctl
+            busbar-admin-${{ github.ref_name }}-${{ matrix.target }}.tar.gz busbar-admin
       - name: upload
         uses: softprops/action-gh-release@v2
         with:
-          files: busbarctl-${{ github.ref_name }}-${{ matrix.target }}.tar.gz
+          files: busbar-admin-${{ github.ref_name }}-${{ matrix.target }}.tar.gz

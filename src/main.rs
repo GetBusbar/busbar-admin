@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #![forbid(unsafe_code)]
 
-//! busbarctl — a human-facing CLI for the busbar gateway's admin API (`/api/v1/admin`).
+//! busbar-admin — a human-facing CLI for the busbar gateway's admin API (`/api/v1/admin`).
 //!
 //! Config resolution is CLI flag > env var > a clear error. The thin admin client lives in
 //! [`client`]; this module is the clap surface + human/JSON rendering.
@@ -13,9 +13,9 @@ use clap::{Args, Parser, Subcommand};
 
 use client::{Client, CreateKeyReq, Tls};
 
-/// busbarctl — talk to a busbar gateway's admin API.
+/// busbar-admin — talk to a busbar gateway's admin API.
 #[derive(Parser)]
-#[command(name = "busbarctl", version, about, long_about = None)]
+#[command(name = "busbar-admin", version, about, long_about = None)]
 struct Cli {
     #[command(flatten)]
     global: GlobalOpts,

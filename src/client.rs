@@ -1,7 +1,7 @@
 //! A thin, hand-rolled admin client for the busbar gateway's `/api/v1/admin` surface.
 //!
 //! The request/response structs below mirror the frozen v1 contract
-//! (`crates/busbar/src/admin/v1/contract`). Only the fields busbarctl actually renders are
+//! (`crates/busbar/src/admin/v1/contract`). Only the fields busbar-admin actually renders are
 //! modelled; unknown fields are ignored (the contract is additive-only), so a newer gateway never
 //! breaks an older CLI. To add an endpoint: add a typed response struct and a method on
 //! [`Client`] that calls [`Client::get`] / [`Client::send`] with the relative path — every method
@@ -58,7 +58,7 @@ impl Client {
         let mut builder = HttpClient::builder()
             .default_headers(headers)
             .timeout(Duration::from_secs(30))
-            .user_agent(concat!("busbarctl/", env!("CARGO_PKG_VERSION")));
+            .user_agent(concat!("busbar-admin/", env!("CARGO_PKG_VERSION")));
 
         if tls.insecure {
             builder = builder.danger_accept_invalid_certs(true);
@@ -202,7 +202,7 @@ impl Client {
         self.get("/info")
     }
 
-    /// `GET /api/v1/admin/keys` — one page (default 200). busbarctl surfaces the first page.
+    /// `GET /api/v1/admin/keys` — one page (default 200). busbar-admin surfaces the first page.
     pub fn list_keys(&self) -> Result<KeyPage> {
         self.get("/keys")
     }

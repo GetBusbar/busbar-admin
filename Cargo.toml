@@ -1,16 +1,16 @@
 [package]
-name = "busbarctl"
+name = "busbar-admin"
 version = "0.1.0"
 edition = "2021"
 license = "Apache-2.0"
 description = "A human-facing CLI for the busbar gateway's admin API (/api/v1/admin)."
-repository = "https://github.com/GetBusbar/busbarctl"
+repository = "https://github.com/GetBusbar/busbar-admin"
 readme = "README.md"
 keywords = ["busbar", "llm", "gateway", "admin", "cli"]
 categories = ["command-line-utilities"]
 
 [[bin]]
-name = "busbarctl"
+name = "busbar-admin"
 path = "src/main.rs"
 
 [dependencies]

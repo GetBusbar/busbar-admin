@@ -1,4 +1,4 @@
-# busbarctl
+# busbar-admin
 
 A human-facing CLI for the [busbar](https://github.com/GetBusbar) gateway's **admin API**
 (`/api/v1/admin`). It speaks the frozen v1 contract over HTTP/HTTPS with a thin, hand-rolled
@@ -11,7 +11,7 @@ From source (published later on crates.io / as a GitHub release + Homebrew tap):
 ```sh
 cargo install --path .
 # or, once published:
-# cargo install busbarctl
+# cargo install busbar-admin
 ```
 
 Prebuilt binaries and a Homebrew formula can follow via a tagged GitHub release (see
@@ -45,7 +45,7 @@ export BUSBAR_ADMIN_TOKEN=your-admin-token
 ### `info` — gateway status
 
 ```sh
-busbarctl info
+busbar-admin info
 ```
 
 ```
@@ -62,12 +62,12 @@ busbar 1.4.0
 ### `keys` — governance virtual keys
 
 ```sh
-busbarctl keys list
-busbarctl keys create my-service \
+busbar-admin keys list
+busbar-admin keys create my-service \
   --budget-cents 5000 --budget-period monthly \
   --rpm 60 --tpm 40000 \
   --allowed-pool default --issue-aws-credential
-busbarctl keys revoke vk_0123456789abcdef
+busbar-admin keys revoke vk_0123456789abcdef
 ```
 
 `keys create` prints the plaintext bearer secret (and any AWS SigV4 secret) **once** —
@@ -76,7 +76,7 @@ it is never retrievable again. Store it immediately.
 ### `hooks` — hook registry
 
 ```sh
-busbarctl hooks list
+busbar-admin hooks list
 ```
 
 > `hooks create` / `hooks remove` are intentionally not implemented in v0.1: the register
@@ -86,9 +86,9 @@ busbarctl hooks list
 ### `config` — running config
 
 ```sh
-busbarctl config version          # current config_version + persistence flag
-busbarctl config show             # the effective running config (redacted, no secrets)
-busbarctl config apply cfg.json   # POST /api/v1/admin/config/apply
+busbar-admin config version          # current config_version + persistence flag
+busbar-admin config show             # the effective running config (redacted, no secrets)
+busbar-admin config apply cfg.json   # POST /api/v1/admin/config/apply
 ```
 
 The apply file is JSON of the shape `{"config": {...}, "providers": {...}}` (the
@@ -100,13 +100,13 @@ disk** — the next reload/restart returns to disk truth.
 Add `--json` to any command to get the gateway's raw JSON for scripting:
 
 ```sh
-busbarctl --json info | jq .version
-busbarctl --json keys list | jq '.items[].id'
+busbar-admin --json info | jq .version
+busbar-admin --json keys list | jq '.items[].id'
 ```
 
 ## Errors
 
-busbarctl turns the common failure modes into actionable messages:
+busbar-admin turns the common failure modes into actionable messages:
 
 - connection refused → `no gateway reachable at <endpoint>`
 - `401` → `admin token rejected`
