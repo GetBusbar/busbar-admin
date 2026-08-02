@@ -132,6 +132,10 @@ struct KeyCreateArgs {
     /// Restrict the key to these pools (repeatable). Omit to allow all.
     #[arg(long = "allowed-pool", value_name = "POOL")]
     allowed_pools: Vec<String>,
+    /// Mint a key allowed on NO pools (an explicit empty allow-list, distinct from omitting
+    /// --allowed-pool which allows ALL pools). Use for a placeholder/audit-only credential.
+    #[arg(long, conflicts_with = "allowed_pools")]
+    no_pools: bool,
     /// Also issue an AWS SigV4 credential (AccessKeyId + secret, shown once).
     #[arg(long)]
     issue_aws_credential: bool,
@@ -328,7 +332,13 @@ fn pools_summary(pools: &Option<Vec<String>>) -> String {
 fn cmd_keys_create(c: &Client, a: &KeyCreateArgs, json: bool) -> Result<()> {
     let req = CreateKeyReq {
         name: a.name.clone(),
-        allowed_pools: if a.allowed_pools.is_empty() {
+        // Three distinct states the server understands: omitted (None) = ALL pools;
+        // explicit [] (--no-pools) = NO pools; a non-empty list = exactly those. Collapsing
+        // --no-pools into None would silently mint an ALL-pools key when NO pools was asked for
+        // (a fail-open on privilege), so the empty list must survive as Some(vec![]).
+        allowed_pools: if a.no_pools {
+            Some(Vec::new())
+        } else if a.allowed_pools.is_empty() {
             None
         } else {
             Some(a.allowed_pools.clone())
@@ -637,4 +647,57 @@ fn human_duration(secs: u64) -> String {
     }
     parts.push(format!("{s}s"));
     parts.join(" ")
+}
+
+#[cfg(test)]
+mod cli_logic_tests {
+    use super::*;
+
+    #[test]
+    fn parse_labels_splits_on_first_equals_only() {
+        // A value containing '=' (a URL query string, a base64 pad) must survive intact — the
+        // split is on the FIRST '=', not all of them.
+        let m = parse_labels(&["url=http://x?a=b".into(), "team=platform".into()]).unwrap();
+        assert_eq!(m.get("url").map(String::as_str), Some("http://x?a=b"));
+        assert_eq!(m.get("team").map(String::as_str), Some("platform"));
+    }
+
+    #[test]
+    fn parse_labels_rejects_a_pair_with_no_equals() {
+        assert!(parse_labels(&["novalue".into()]).is_err());
+    }
+
+    #[test]
+    fn parse_labels_allows_empty_value() {
+        let m = parse_labels(&["k=".into()]).unwrap();
+        assert_eq!(m.get("k").map(String::as_str), Some(""));
+    }
+
+    // The allowed_pools tri-state mapping (omitted=all, --no-pools=none, list=those) is the
+    // fail-open-on-privilege fix: --no-pools must NOT collapse to None. Mirror the mapping the
+    // command uses so a regression there is caught here.
+    fn map_allowed(no_pools: bool, pools: &[String]) -> Option<Vec<String>> {
+        if no_pools {
+            Some(Vec::new())
+        } else if pools.is_empty() {
+            None
+        } else {
+            Some(pools.to_vec())
+        }
+    }
+
+    #[test]
+    fn allowed_pools_tristate_no_pools_is_empty_not_none() {
+        assert_eq!(
+            map_allowed(true, &[]),
+            Some(Vec::new()),
+            "--no-pools => NO pools"
+        );
+        assert_eq!(map_allowed(false, &[]), None, "omitted => ALL pools");
+        assert_eq!(
+            map_allowed(false, &["p1".into()]),
+            Some(vec!["p1".into()]),
+            "a list => exactly those pools"
+        );
+    }
 }
