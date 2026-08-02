@@ -25,3 +25,38 @@ jobs:
         run: cargo build --locked --verbose
       - name: test
         run: cargo test --locked --verbose
+
+  spec-drift:
+    # The admin client is hand-rolled against openapi.json (committed at the repo root).
+    # Fail when the latest busbar release ships a NEWER spec version than the one committed,
+    # so drift is visible instead of silent. Degrades to a warning if the GitHub API is
+    # unavailable or rate-limited (keeps the check non-flaky).
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: compare committed spec version to the latest busbar release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -u
+          committed=$(jq -r .info.version openapi.json)
+          echo "committed spec version: $committed"
+          resp=$(curl -sS --max-time 30 \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            https://api.github.com/repos/GetBusbar/busbar/releases/latest) || {
+              echo "::warning::could not reach the GitHub API to check the latest busbar release; skipping spec-drift check"
+              exit 0
+            }
+          latest=$(echo "$resp" | jq -r '.tag_name // empty' | sed 's/^v//')
+          if [ -z "$latest" ]; then
+            echo "::warning::GitHub API returned no usable release tag (rate-limited?); skipping spec-drift check"
+            echo "$resp" | head -c 500
+            exit 0
+          fi
+          echo "latest busbar release: $latest"
+          if [ "$committed" != "$latest" ]; then
+            echo "::error::committed openapi.json is v$committed but the latest busbar release is v$latest — refresh the spec and re-audit src/client.rs"
+            exit 1
+          fi
+          echo "spec is current (v$committed)"

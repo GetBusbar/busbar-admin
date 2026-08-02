@@ -4,6 +4,9 @@ A human-facing CLI for the [busbar](https://github.com/GetBusbar) gateway's **ad
 (`/api/v1/admin`). It speaks the frozen v1 contract over HTTP/HTTPS with a thin, hand-rolled
 client (no OpenAPI generator), so it's small and easy to extend.
 
+The contract it targets is committed at [`openapi.json`](openapi.json) (busbar **1.5.0**);
+CI compares that spec's version against the latest busbar release so drift is visible.
+
 ## Install
 
 From source (published later on crates.io / as a GitHub release + Homebrew tap):
@@ -49,7 +52,7 @@ busbar-admin info
 ```
 
 ```
-busbar 1.4.0
+busbar 1.5.0
   uptime:           1m 12s
   config version:   0
   config persist:   off (live-only)
@@ -64,14 +67,20 @@ busbar 1.4.0
 ```sh
 busbar-admin keys list
 busbar-admin keys create my-service \
-  --budget-cents 5000 --budget-period monthly \
-  --rpm 60 --tpm 40000 \
+  --group team-a --expires-in 30d \
+  --label team=platform \
   --allowed-pool default --issue-aws-credential
-busbar-admin keys revoke vk_0123456789abcdef
+busbar-admin keys get vk_0123456789abcdef       # metadata + state (never the secret)
+busbar-admin keys rotate vk_0123456789abcdef    # fresh credential in place, shown once
+busbar-admin keys revoke vk_0123456789abcdef    # denylist; the record stays for audit
+busbar-admin keys delete vk_0123456789abcdef    # revoke AND forget (tombstone)
 ```
 
-`keys create` prints the plaintext bearer secret (and any AWS SigV4 secret) **once** —
-it is never retrievable again. Store it immediately.
+As of busbar 1.5.0, keys are **pure auth**: a minted key is a busbar-signed expiring
+token, and budgets/rate limits flow through the bound `--group` (a `groups:` bucket)
+rather than per-key `--budget-cents`/`--rpm`/`--tpm` flags. `keys create` prints the
+signed token (and any AWS SigV4 secret) **once** — it is never retrievable again.
+Store it immediately.
 
 ### `hooks` — hook registry
 
@@ -82,6 +91,17 @@ busbar-admin hooks list
 > `hooks create` / `hooks remove` are intentionally not implemented in v0.1: the register
 > endpoint (`POST /api/v1/admin/hooks`) takes a full transport/grants definition better
 > expressed in config.yaml or the Terraform provider. `hooks list` covers inspection.
+
+### `plugins` — signed plugin catalog (1.5.0)
+
+```sh
+busbar-admin plugins list --type store    # auth | hooks | store (default: store)
+busbar-admin plugins install ./my-store-plugin.tar.gz
+busbar-admin plugins reload               # re-scan the plugins directory
+```
+
+`plugins install` uploads a **signed** plugin tarball; the gateway re-verifies the
+signature against its running trust posture (the client is never trusted).
 
 ### `config` — running config
 
