@@ -82,6 +82,11 @@ rather than per-key `--budget-cents`/`--rpm`/`--tpm` flags. `keys create` prints
 signed token (and any AWS SigV4 secret) **once** — it is never retrievable again.
 Store it immediately.
 
+Pool access is three-state. Omitting `--allowed-pool` allows **all** pools; one or more
+`--allowed-pool` flags restrict the key to exactly those; and `--no-pools` mints a key
+allowed on **no** pool at all (an explicit empty allow-list — e.g. a placeholder or
+audit-only credential). `--no-pools` and `--allowed-pool` are mutually exclusive.
+
 ### `hooks` — hook registry
 
 ```sh

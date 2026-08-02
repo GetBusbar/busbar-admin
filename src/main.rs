@@ -13,6 +13,21 @@ use clap::{Args, Parser, Subcommand};
 
 use client::{Client, CreateKeyReq, InstallPluginReq, KeyView, PluginView, Tls};
 
+/// Resolve the three distinct `allowed_pools` states the server understands: omitted (`None`) =
+/// ALL pools; an explicit empty list (`--no-pools`) = NO pools; a non-empty list = exactly those.
+/// A shared function so `cmd_keys_create` and its test exercise the SAME mapping — collapsing
+/// `--no-pools` into `None` would mint an all-pools key when no-pools was asked for (fail-open on
+/// privilege).
+fn resolve_allowed_pools(no_pools: bool, pools: &[String]) -> Option<Vec<String>> {
+    if no_pools {
+        Some(Vec::new())
+    } else if pools.is_empty() {
+        None
+    } else {
+        Some(pools.to_vec())
+    }
+}
+
 /// busbar-admin — talk to a busbar gateway's admin API.
 #[derive(Parser)]
 #[command(name = "busbar-admin", version, about, long_about = None)]
@@ -336,13 +351,7 @@ fn cmd_keys_create(c: &Client, a: &KeyCreateArgs, json: bool) -> Result<()> {
         // explicit [] (--no-pools) = NO pools; a non-empty list = exactly those. Collapsing
         // --no-pools into None would silently mint an ALL-pools key when NO pools was asked for
         // (a fail-open on privilege), so the empty list must survive as Some(vec![]).
-        allowed_pools: if a.no_pools {
-            Some(Vec::new())
-        } else if a.allowed_pools.is_empty() {
-            None
-        } else {
-            Some(a.allowed_pools.clone())
-        },
+        allowed_pools: resolve_allowed_pools(a.no_pools, &a.allowed_pools),
         group: a.group.clone(),
         parent: a.parent.clone(),
         expires_in: a.expires_in.clone(),
@@ -461,6 +470,9 @@ fn cmd_plugins_list(c: &Client, plugin_type: &str, json: bool) -> Result<()> {
         return Ok(());
     }
     print_plugin_rows(&page.items);
+    if page.next_cursor.is_some() {
+        println!("(more {plugin_type} plugins available — showing the first page)");
+    }
     Ok(())
 }
 
@@ -561,6 +573,9 @@ fn cmd_hooks_list(c: &Client, json: bool) -> Result<()> {
             h.transport.target.as_deref().unwrap_or("-"),
         );
     }
+    if page.next_cursor.is_some() {
+        println!("(more hooks available — showing the first page)");
+    }
     Ok(())
 }
 
@@ -601,16 +616,26 @@ fn cmd_config_apply(c: &Client, file: &std::path::Path, json: bool) -> Result<()
         .with_context(|| format!("parsing {} as JSON", file.display()))?;
     let resp = c.config_apply(&body)?;
     if json {
-        return print_json(&resp);
+        print_json(&resp)?;
     }
-    let v = resp
-        .get("config_version")
-        .and_then(|v| v.as_u64())
-        .map(|v| v.to_string())
-        .unwrap_or_else(|| "?".into());
-    println!("config applied — now at version {v}");
-    if let Some(note) = resp.get("note").and_then(|n| n.as_str()) {
-        println!("note: {note}");
+    // The server signals ACCEPTED-BUT-NOT-APPLIED in-band via `applied: false` on a 200 — a soft
+    // failure the HTTP status alone doesn't convey. A scriptable caller (`... && echo ok`) must
+    // see a nonzero exit here, not a "config applied" success line.
+    if !resp.applied {
+        anyhow::bail!(
+            "gateway did NOT apply the config (applied=false){}",
+            if resp.note.is_empty() {
+                String::new()
+            } else {
+                format!(": {}", resp.note)
+            }
+        );
+    }
+    if !json {
+        println!("config applied — now at version {}", resp.config_version);
+        if !resp.note.is_empty() {
+            println!("note: {}", resp.note);
+        }
     }
     Ok(())
 }
@@ -673,29 +698,24 @@ mod cli_logic_tests {
         assert_eq!(m.get("k").map(String::as_str), Some(""));
     }
 
-    // The allowed_pools tri-state mapping (omitted=all, --no-pools=none, list=those) is the
-    // fail-open-on-privilege fix: --no-pools must NOT collapse to None. Mirror the mapping the
-    // command uses so a regression there is caught here.
-    fn map_allowed(no_pools: bool, pools: &[String]) -> Option<Vec<String>> {
-        if no_pools {
-            Some(Vec::new())
-        } else if pools.is_empty() {
-            None
-        } else {
-            Some(pools.to_vec())
-        }
-    }
-
+    // Calls the REAL `resolve_allowed_pools` that `cmd_keys_create` uses — not a copy — so a
+    // regression in the actual fail-open-on-privilege mapping fails this test. (The round-1
+    // version tested a duplicated helper and was tautological: it passed even if the real code
+    // regressed.)
     #[test]
     fn allowed_pools_tristate_no_pools_is_empty_not_none() {
         assert_eq!(
-            map_allowed(true, &[]),
+            resolve_allowed_pools(true, &[]),
             Some(Vec::new()),
             "--no-pools => NO pools"
         );
-        assert_eq!(map_allowed(false, &[]), None, "omitted => ALL pools");
         assert_eq!(
-            map_allowed(false, &["p1".into()]),
+            resolve_allowed_pools(false, &[]),
+            None,
+            "omitted => ALL pools"
+        );
+        assert_eq!(
+            resolve_allowed_pools(false, &["p1".into()]),
             Some(vec!["p1".into()]),
             "a list => exactly those pools"
         );

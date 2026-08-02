@@ -59,6 +59,11 @@ impl Client {
         let mut builder = HttpClient::builder()
             .default_headers(headers)
             .timeout(Duration::from_secs(30))
+            // Never follow redirects. The admin token rides as the custom `x-admin-token` header,
+            // and reqwest strips `Authorization` across a cross-origin redirect but NOT custom
+            // headers — so a malicious or MITM'd 3xx to another host would exfiltrate the token.
+            // A CLI talking to one admin endpoint has no legitimate reason to follow a redirect.
+            .redirect(reqwest::redirect::Policy::none())
             .user_agent(concat!("busbar-admin/", env!("CARGO_PKG_VERSION")));
 
         if tls.insecure {
@@ -264,9 +269,22 @@ impl Client {
     }
 
     /// `POST /api/v1/admin/config/apply` — apply a full config carried in the body.
-    pub fn config_apply(&self, body: &serde_json::Value) -> Result<serde_json::Value> {
+    pub fn config_apply(&self, body: &serde_json::Value) -> Result<ConfigApplyView> {
         self.send(Method::POST, "/config/apply", Some(body))
     }
+}
+
+/// `POST /config/apply` response (`ConfigApplyView`). `applied` is REQUIRED by the 1.5.0 contract
+/// and carries the in-band success signal: a 200 with `applied: false` is an ACCEPTED-BUT-NOT-
+/// APPLIED soft failure (the HTTP status alone does not tell the whole story), so a scriptable
+/// caller must branch on it rather than treat any 2xx as success.
+#[derive(Debug, Deserialize, Serialize)]
+pub struct ConfigApplyView {
+    pub applied: bool,
+    #[serde(default)]
+    pub config_version: u64,
+    #[serde(default)]
+    pub note: String,
 }
 
 // ── Contract-mirroring request/response types ────────────────────────────────────────────────
