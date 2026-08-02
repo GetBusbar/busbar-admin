@@ -26,6 +26,32 @@ jobs:
       - name: test
         run: cargo test --locked --verbose
 
+  integration:
+    # BIDIRECTIONAL TESTING (matches how the plugin repos test themselves against busbar): download
+    # the latest RELEASED busbar, boot it, and drive EVERY busbar-admin command against it, asserting
+    # real effects. Catches client drift a `cargo build` never would — a renamed field, a changed
+    # status code, a broken auth header. (busbar core's own dev-gate runs the SAME scripts/
+    # integration.sh against the freshly-built engine, the reverse direction.)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build busbar-admin
+        run: cargo build --release --locked
+      - name: Download the latest released busbar (linux x86_64)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release download --repo GetBusbar/busbar \
+            --pattern 'busbar-x86_64-unknown-linux-gnu.tar.gz' --dir /tmp/busbar-dl
+          tar -xzf /tmp/busbar-dl/busbar-x86_64-unknown-linux-gnu.tar.gz -C /tmp/busbar-dl
+          chmod +x /tmp/busbar-dl/busbar
+          /tmp/busbar-dl/busbar --version
+      - name: Drive every command against the real gateway
+        run: scripts/integration.sh /tmp/busbar-dl/busbar target/release/busbar-admin
+
   spec-drift:
     # The admin client is hand-rolled against openapi.json (committed at the repo root).
     # Fail when the latest busbar release ships a NEWER spec version than the one committed,
