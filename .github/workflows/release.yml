@@ -5,7 +5,7 @@ name: Release
 
 on:
   push:
-    tags: ["v*"]
+    tags: ["v*", "!v*-*"] # never publish on a -rc prerelease (qa staging marker)
 
 permissions:
   contents: write
