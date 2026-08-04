@@ -4,7 +4,7 @@ A human-facing CLI for the [busbar](https://github.com/GetBusbar) gateway's **ad
 (`/api/v1/admin`). It speaks the frozen v1 contract over HTTP/HTTPS with a thin, hand-rolled
 client (no OpenAPI generator), so it's small and easy to extend.
 
-The contract it targets is committed at [`openapi.json`](openapi.json) (busbar **1.5.0**);
+The contract it targets is committed at [`openapi.json`](openapi.json) (busbar **1.5.2**);
 CI compares that spec's version against the latest busbar release so drift is visible.
 
 ## Install
@@ -52,7 +52,7 @@ busbar-admin info
 ```
 
 ```
-busbar 1.5.0
+busbar 1.5.2
   uptime:           1m 12s
   config version:   0
   config persist:   off (live-only)
@@ -97,16 +97,23 @@ busbar-admin hooks list
 > endpoint (`POST /api/v1/admin/hooks`) takes a full transport/grants definition better
 > expressed in config.yaml or the Terraform provider. `hooks list` covers inspection.
 
-### `plugins` — signed plugin catalog (1.5.0)
+### `plugins` — signed plugin catalog (1.5.2)
 
 ```sh
 busbar-admin plugins list --type store    # auth | hooks | store (default: store)
 busbar-admin plugins install ./my-store-plugin.tar.gz
+busbar-admin plugins inspect ./my-store-plugin.tar.gz   # preview WITHOUT installing
 busbar-admin plugins reload               # re-scan the plugins directory
 ```
 
 `plugins install` uploads a **signed** plugin tarball; the gateway re-verifies the
 signature against its running trust posture (the client is never trusted).
+
+`plugins inspect` (added in busbar 1.5.2) is a **stateless** preview: the gateway verifies
+the tarball's signature and parses its manifest **without installing anything**, reporting
+the plugin's name/version/kind, trust verdict, restart-scoping default, and its settings
+schema. An untrusted or rejected candidate is reported (never refused), so you can vet an
+artifact before committing to `plugins install`.
 
 ### `config` — running config
 

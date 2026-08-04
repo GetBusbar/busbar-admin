@@ -11,7 +11,7 @@ mod client;
 use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand};
 
-use client::{Client, CreateKeyReq, InstallPluginReq, KeyView, PluginView, Tls};
+use client::{Client, CreateKeyReq, InspectPluginReq, InstallPluginReq, KeyView, PluginView, Tls};
 
 /// Resolve the three distinct `allowed_pools` states the server understands: omitted (`None`) =
 /// ALL pools; an explicit empty list (`--no-pools`) = NO pools; a non-empty list = exactly those.
@@ -172,6 +172,16 @@ enum PluginsCmd {
         #[arg(long, value_name = "FILE")]
         file: Option<String>,
     },
+    /// Preview a candidate plugin tarball WITHOUT installing it (stateless): verify its
+    /// signature, parse its manifest, and report its name/version/kind/trust and settings schema.
+    Inspect {
+        /// Path to the candidate plugin tarball (.tar.gz).
+        tarball: std::path::PathBuf,
+        /// Filename to report the artifact under (defaults to the tarball's basename). Unused
+        /// server-side — inspect never writes to disk — but sent for shape parity with install.
+        #[arg(long, value_name = "FILE")]
+        file: Option<String>,
+    },
     /// Re-scan the plugins directory and show the reconciled inventory.
     Reload,
 }
@@ -245,6 +255,9 @@ fn run() -> Result<()> {
             PluginsCmd::List { plugin_type } => cmd_plugins_list(&c, plugin_type, json),
             PluginsCmd::Install { tarball, file } => {
                 cmd_plugins_install(&c, tarball, file.as_deref(), json)
+            }
+            PluginsCmd::Inspect { tarball, file } => {
+                cmd_plugins_inspect(&c, tarball, file.as_deref(), json)
             }
             PluginsCmd::Reload => cmd_plugins_reload(&c, json),
         },
@@ -530,6 +543,57 @@ fn cmd_plugins_install(
     if !installed.note.is_empty() {
         println!("note: {}", installed.note);
     }
+    Ok(())
+}
+
+fn cmd_plugins_inspect(
+    c: &Client,
+    tarball: &std::path::Path,
+    file: Option<&str>,
+    json: bool,
+) -> Result<()> {
+    use base64::Engine as _;
+    let bytes = std::fs::read(tarball)
+        .with_context(|| format!("reading plugin tarball {}", tarball.display()))?;
+    let file = match file {
+        Some(f) => f.to_string(),
+        None => tarball
+            .file_name()
+            .and_then(|f| f.to_str())
+            .context("tarball path has no usable filename; pass --file")?
+            .to_string(),
+    };
+    let req = InspectPluginReq {
+        file,
+        tarball_b64: base64::engine::general_purpose::STANDARD.encode(&bytes),
+    };
+    let preview = c.inspect_plugin(&req)?;
+    if json {
+        return print_json(&preview);
+    }
+    println!(
+        "plugin {} v{} (kind: {}, trust: {})",
+        preview.name,
+        preview.version.as_deref().unwrap_or("?"),
+        preview.kind.as_deref().unwrap_or("-"),
+        preview.trust,
+    );
+    println!(
+        "  restart required (default): {}",
+        opt(preview.restart_required_default)
+    );
+    println!(
+        "  settings schema: {}",
+        if preview.schema.is_some() {
+            "present"
+        } else {
+            "(none)"
+        }
+    );
+    if let Some(err) = &preview.schema_error {
+        println!("  schema error: {err}");
+    }
+    println!("(preview only — nothing was installed)");
     Ok(())
 }
 

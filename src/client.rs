@@ -2,7 +2,7 @@
 //!
 //! The request/response structs below mirror the frozen v1 contract
 //! (`crates/busbar/src/admin/v1/contract`; the committed `openapi.json` at the repo root is the
-//! canonical spec this client was audited against — busbar 1.5.0). Only the fields busbar-admin actually renders are
+//! canonical spec this client was audited against — busbar 1.5.2). Only the fields busbar-admin actually renders are
 //! modelled; unknown fields are ignored (the contract is additive-only), so a newer gateway never
 //! breaks an older CLI. To add an endpoint: add a typed response struct and a method on
 //! [`Client`] that calls [`Client::get`] / [`Client::send`] with the relative path — every method
@@ -252,6 +252,14 @@ impl Client {
         self.send(Method::POST, "/plugins", Some(req))
     }
 
+    /// `POST /api/v1/admin/plugins/inspect` — STATELESS preview of a candidate plugin tarball
+    /// (bytes ride as base64). The engine verifies the signature and parses the manifest WITHOUT
+    /// installing anything, returning the manifest's settings schema plus name/version/kind/trust.
+    /// An untrusted/rejected candidate is reported (via `trust`), never refused.
+    pub fn inspect_plugin(&self, req: &InspectPluginReq) -> Result<InspectView> {
+        self.send(Method::POST, "/plugins/inspect", Some(req))
+    }
+
     /// `POST /api/v1/admin/plugins/reload` — re-scan the plugins directory and return the
     /// reconciled dynamic-library inventory.
     pub fn reload_plugins(&self) -> Result<PluginReloadView> {
@@ -274,7 +282,7 @@ impl Client {
     }
 }
 
-/// `POST /config/apply` response (`ConfigApplyView`). `applied` is REQUIRED by the 1.5.0 contract
+/// `POST /config/apply` response (`ConfigApplyView`). `applied` is REQUIRED by the 1.5.2 contract
 /// and carries the in-band success signal: a 200 with `applied: false` is an ACCEPTED-BUT-NOT-
 /// APPLIED soft failure (the HTTP status alone does not tell the whole story), so a scriptable
 /// caller must branch on it rather than treat any 2xx as success.
@@ -517,6 +525,45 @@ pub struct PluginInstallView {
     pub note: String,
 }
 
+/// `POST /plugins/inspect` request body (`InspectPluginReq`): SAME shape as `InstallPluginReq`
+/// (`file` + `tarball_b64`). Inspect never writes to disk, so `file` is accepted only for shape
+/// parity with the install flow and is otherwise unused server-side.
+#[derive(Debug, Serialize)]
+pub struct InspectPluginReq {
+    pub file: String,
+    pub tarball_b64: String,
+}
+
+/// `POST /plugins/inspect` response (`PluginSchemaView`): a stateless preview of the candidate's
+/// signed manifest — the same shape `GET /plugins/{file}/schema` carries, plus `version`/`kind`.
+/// `schema_error` is set (distinctly from a bare `schema: null`) only when the manifest DID set a
+/// `settings_schema` that failed to parse. Only the fields busbar-admin renders are modelled.
+#[derive(Debug, Deserialize, Serialize)]
+pub struct InspectView {
+    pub name: String,
+    #[serde(default)]
+    pub version: Option<String>,
+    /// The plugin's `kind` (`hook` | `secret` | `auth` | `store` | …); `null` when the candidate
+    /// cannot be resolved to a manifest.
+    #[serde(default)]
+    pub kind: Option<String>,
+    /// `trusted` | `unverified` | `rejected` (the plugin-catalog trust vocabulary).
+    pub trust: String,
+    /// `describe` (a live hook answered) or `manifest`; for inspect it is always `manifest`.
+    #[serde(default)]
+    pub source: String,
+    /// The kind-derived restart-scoping default; `null` when there is no resolvable manifest/kind.
+    #[serde(default)]
+    pub restart_required_default: Option<bool>,
+    /// The plugin's settings JSON Schema verbatim, or `null` (no schema, or one that failed to
+    /// parse — see `schema_error`).
+    #[serde(default)]
+    pub schema: Option<serde_json::Value>,
+    /// Set only when the manifest's `settings_schema` was present but failed to parse.
+    #[serde(default)]
+    pub schema_error: Option<String>,
+}
+
 /// `POST /plugins/reload` response: the reconciled dynamic-library inventory.
 #[derive(Debug, Deserialize, Serialize)]
 pub struct PluginReloadView {
@@ -566,7 +613,7 @@ pub struct HookPage {
 
 #[cfg(test)]
 mod spec_shape_tests {
-    // These lock the 1.5.0 wire shapes this crate was realigned to (commit that repaired the
+    // These lock the 1.5.2 wire shapes this crate was realigned to (commit that repaired the
     // 1.4.x drift). The spec-drift CI job only checks the committed openapi.json's VERSION string;
     // it does NOT check that these structs still match the spec's schemas. Without these, a
     // rebase reintroducing a 1.4.x field, or flipping `allowed_pools` back to a non-Option Vec,
@@ -671,5 +718,43 @@ mod spec_shape_tests {
             serde_json::from_str(r#"{"id":"vk_1","name":"n","token":"bbk_new"}"#).unwrap();
         assert_eq!(r.token.as_deref(), Some("bbk_new"));
         assert_eq!(r.secret, None);
+    }
+
+    #[test]
+    fn inspect_view_carries_manifest_preview_shape() {
+        // 1.5.2 added POST /plugins/inspect — a stateless preview whose body is the PluginSchemaView
+        // shape plus version/kind. This pins the fields busbar-admin renders so a future spec resync
+        // that drops/renames one (e.g. `trust`, `schema_error`, or the new `version`) fails loudly.
+        let v: InspectView = serde_json::from_str(
+            r#"{"name":"acme-store","version":"1.2.3","kind":"store","trust":"unverified",
+                "source":"manifest","restart_required_default":true,
+                "schema":{"type":"object"},"schema_error":null}"#,
+        )
+        .expect("inspect preview must decode");
+        assert_eq!(v.name, "acme-store");
+        assert_eq!(v.version.as_deref(), Some("1.2.3"));
+        assert_eq!(v.kind.as_deref(), Some("store"));
+        assert_eq!(v.trust, "unverified");
+        assert_eq!(v.restart_required_default, Some(true));
+        assert!(v.schema.is_some());
+        assert_eq!(v.schema_error, None);
+    }
+
+    #[test]
+    fn inspect_view_tolerates_null_kind_and_absent_version() {
+        // An unresolvable candidate reports kind/version/restart_required_default as null; the CLI
+        // must still decode (never refuse) so it can render the `trust`/`schema_error` verdict.
+        let v: InspectView = serde_json::from_str(
+            r#"{"name":"bad","kind":null,"trust":"rejected","source":"manifest","schema":null,
+                "schema_error":"settings_schema is not valid JSON"}"#,
+        )
+        .expect("a rejected/unresolvable candidate must still decode");
+        assert_eq!(v.kind, None);
+        assert_eq!(v.version, None);
+        assert_eq!(v.trust, "rejected");
+        assert_eq!(
+            v.schema_error.as_deref(),
+            Some("settings_schema is not valid JSON")
+        );
     }
 }
