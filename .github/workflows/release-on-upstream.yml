@@ -14,6 +14,12 @@ name: release-on-upstream
 #     than the committed openapi.json — an idle day is a no-op, so cron can never runaway-tag.
 #   - workflow_dispatch: always acts (a human explicitly asked).
 # The final gate is a green `cargo build --locked` on the refreshed spec: a broken build never tags.
+#
+# ── RELEASE TRAIN (one-push fleet release) ────────────────────────────────────────────────────────
+# On a core upstream-release dispatch this additionally rc-GATEs (proceed only if this repo carries a
+# v${version}-rc.* staging tag — see .github/scripts/rc-promote.sh gate), PROMOTEs qa→main by
+# fast-forward only, THEN runs the existing refresh+cut below, THEN CLEANs the consumed rc tags. The
+# schedule (self-heal) and manual workflow_dispatch paths are UNCHANGED (no rc-gate, no qa→main).
 on:
   repository_dispatch:
     types: [upstream-release]
@@ -25,6 +31,11 @@ on:
         description: "busbar core tag to build against (e.g. v1.6.0). Blank = core's latest release."
         required: false
         type: string
+      dry_run:
+        description: "Log what would happen (promote qa→main, cut) without pushing/tagging."
+        required: false
+        type: boolean
+        default: true
 
 permissions:
   contents: write
@@ -49,10 +60,49 @@ jobs:
           git config user.name "busbar-bot"
           git config user.email "bot@getbusbar.com"
 
+      - name: Resolve dry-run / arm mode
+        id: mode
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_DRY_RUN: ${{ github.event.inputs.dry_run }}
+        run: |
+          set -euo pipefail
+          # ══════════════════════════════════════════════════════════════════════════════════════
+          #  ⚑ THE ARM TOGGLE ⚑  — flip DRY_RUN_DEFAULT to "false" to ARM the release train.
+          #  While "true", an upstream-release dispatch only LOGS the qa→main promote + cut it WOULD
+          #  do (nothing is pushed or tagged). This is the ONE switch the orchestrator flips to go live.
+          # ══════════════════════════════════════════════════════════════════════════════════════
+          DRY_RUN_DEFAULT="true"
+          case "$EVENT_NAME" in
+            repository_dispatch) dry="$DRY_RUN_DEFAULT" ;;              # the release-train path
+            workflow_dispatch)   dry="${INPUT_DRY_RUN:-true}" ;;        # human chooses (default safe)
+            schedule)            dry="false" ;;                         # self-heal cron: unchanged
+            *)                   dry="true" ;;
+          esac
+          echo "dry_run=$dry" >> "$GITHUB_OUTPUT"
+          echo "DRY_RUN=$dry" >> "$GITHUB_ENV"
+          echo "::notice::event=$EVENT_NAME dry_run=$dry"
+
+      - name: rc-gate (release-train staging check)
+        id: gate
+        if: github.event_name == 'repository_dispatch'
+        env:
+          VERSION: ${{ github.event.client_payload.version }}
+        run: .github/scripts/rc-promote.sh gate
+
+      - name: Promote qa→main (fast-forward only)
+        if: github.event_name == 'repository_dispatch' && steps.gate.outputs.staged == 'yes'
+        env:
+          DRY_RUN: ${{ steps.mode.outputs.dry_run }}
+        run: .github/scripts/rc-promote.sh promote
+
       - uses: dtolnay/rust-toolchain@stable
 
       - name: Resolve target core release
         id: resolve
+        # rc-gate: an upstream-release dispatch to a repo not staged for this version stops here.
+        # Non-dispatch events (schedule/manual) leave staged unset ('' != 'no') → run as before.
+        if: steps.gate.outputs.staged != 'no'
         env:
           GH_TOKEN: ${{ secrets.RELEASE_DISPATCH_TOKEN }}
           EVENT_NAME: ${{ github.event_name }}
@@ -96,6 +146,7 @@ jobs:
           GH_TOKEN: ${{ secrets.RELEASE_DISPATCH_TOKEN }}
           CORE_TAG: ${{ steps.resolve.outputs.tag }}
           CORE_VER: ${{ steps.resolve.outputs.ver }}
+          DRY_RUN: ${{ steps.mode.outputs.dry_run }}
         run: |
           set -euo pipefail
           gh release download "$CORE_TAG" --repo GetBusbar/busbar \
@@ -117,6 +168,13 @@ jobs:
           fi
           nver="${next#v}"
 
+          # ── DRY-RUN gate ── ARMED ONLY below this line. Until the train is armed this logs the exact
+          # cut it WOULD make and exits 0 without committing, tagging, or pushing anything.
+          if [ "${DRY_RUN:-true}" = "true" ]; then
+            echo "::notice::[dry-run] would refresh openapi.json to ${CORE_TAG}, bump Cargo.toml to ${nver}, commit+push main, then tag ${next} and push it (firing release.yml). Nothing pushed."
+            exit 0
+          fi
+
           # Bump the package version; a plain build re-syncs Cargo.lock so release.yml's --locked holds.
           sed -i -E "s/^version = \"[^\"]*\"/version = \"${nver}\"/" Cargo.toml
           cargo build
@@ -126,3 +184,12 @@ jobs:
           git tag "$next"
           git push origin "refs/tags/${next}"
           echo "::notice::pushed ${next} — release.yml will build + upload the binaries"
+
+      - name: Cleanup consumed vX-rc.* staging tags (best-effort)
+        # Only on the release-train path (staged==yes), and only if nothing above FAILED (no
+        # always()). Honors DRY_RUN internally (logs when dry).
+        if: steps.gate.outputs.staged == 'yes'
+        env:
+          VERSION: ${{ github.event.client_payload.version }}
+          DRY_RUN: ${{ steps.mode.outputs.dry_run }}
+        run: .github/scripts/rc-promote.sh cleanup
