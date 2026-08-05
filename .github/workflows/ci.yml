@@ -116,15 +116,33 @@ jobs:
     # real, answerable obligation. It cannot be red for being ahead either — the client only ever
     # gets ahead by someone copying a newer spec in, which they do together with the release.
     #
-    # What it CANNOT see is structural drift under an unchanged `info.version` — and that is not
-    # hypothetical: core `dev` and this repo's committed copy are BOTH stamped 1.5.2 while core has
-    # already replaced the hooks-status `settings` bag with `settings_keys`/`drift_keys`. So a
-    # second, PAIRED, NON-BLOCKING step below diffs the whole document against core at this run's
-    # branch. Non-blocking on purpose: mid-cycle the paired spec is SUPPOSED to be ahead of the
-    # committed copy, so a hard failure there would be a permanently-red gate.
+    # What it CANNOT see is structural drift under an unchanged `info.version` — and that was not
+    # hypothetical. Core `dev` and this repo's committed copy were BOTH stamped 1.5.2 while core had
+    # already replaced the hook `settings` bag with `settings_keys` (and added `drift_keys` to the
+    # hooks-status body). A version-only comparison can never go red on that, and a check that
+    # cannot fail is the same defect class as a gate that reports green having run nothing.
+    #
+    # So the blind spot is closed by a SECOND, PAIRED, BLOCKING step: `cargo test spec_contract`
+    # with `BUSBAR_SPEC` pointed at core's own generated spec at this run's branch. Those tests
+    # compare the structs in `src/client.rs` against the spec document field by field — no phantom
+    # fields (the anti-RENAME arm), and no REQUIRED field silently ignored (the anti-BLIND-SPOT
+    # arm) — with the modelled field set derived by serializing the real structs so it cannot drift
+    # from the types.
+    #
+    # This one CAN block without being permanently red, which the old whole-document diff could
+    # not. The difference is scope: the diff compared EVERYTHING, so core legitimately racing ahead
+    # mid-cycle with new endpoints made it red for a reason nobody should act on. The contract test
+    # is scoped to what this client actually CONSUMES, so a new endpoint or a new optional field in
+    # core is invisible to it, and only a removal, a rename, or a new required field this client
+    # drops on the floor can fail it. Those are exactly the changes a human must act on.
+    #
+    # The whole-document diff is kept below it, still informational, as the context you want when
+    # the blocking step tells you something moved.
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
       - name: compare committed spec version to the latest busbar release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -152,14 +170,32 @@ jobs:
           fi
           echo "spec is current (v$committed)"
 
-      # ── PAIRED, STRUCTURAL, NON-BLOCKING (see the job comment above) ────────────────────────────
+      # ── PAIRED + STRUCTURAL (see the job comment above) ─────────────────────────────────────────
       - name: Checkout busbar (sibling, SAME branch as this run)
+        id: pair
         uses: actions/checkout@v4
         continue-on-error: true
         with:
           repository: GetBusbar/busbar
           ref: ${{ env.BUSBAR_REF }}
           path: busbarAI
+
+      # BLOCKING. Consumption-scoped, so core being ahead mid-cycle does not make it red — only a
+      # shape this client actually reads changing underneath it does.
+      - name: structural contract check against the PAIRED core spec (BLOCKING)
+        if: steps.pair.outcome == 'success'
+        env:
+          BUSBAR_SPEC: busbarAI/crates/busbar/src/admin/v1/json/openapi.json
+        run: |
+          set -eu
+          [ -f "$BUSBAR_SPEC" ] || {
+            echo "::error::paired core spec not present at $BUSBAR_SPEC"
+            exit 1
+          }
+          echo "committed: v$(jq -r .info.version openapi.json)   paired core ($BUSBAR_REF): v$(jq -r .info.version "$BUSBAR_SPEC")"
+          echo "(version stamps are NOT what this step checks — it compares src/client.rs to the spec's schemas)"
+          cargo test --locked spec_contract -- --nocapture
+
       - name: structural diff against the PAIRED core spec (informational — never blocks)
         continue-on-error: true
         run: |

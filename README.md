@@ -4,8 +4,11 @@ A human-facing CLI for the [busbar](https://github.com/GetBusbar) gateway's **ad
 (`/api/v1/admin`). It speaks the frozen v1 contract over HTTP/HTTPS with a thin, hand-rolled
 client (no OpenAPI generator), so it's small and easy to extend.
 
-The contract it targets is committed at [`openapi.json`](openapi.json) (busbar **1.5.2**);
-CI compares that spec's version against the latest busbar release so drift is visible.
+The contract it targets is committed at [`openapi.json`](openapi.json) (busbar **1.5.2**). Drift is
+caught two ways: CI compares that spec's version against the latest busbar release, and a set of
+contract tests compares the client's own structs against the spec's schemas field by field — locally
+against the committed copy, and in CI against core's spec at the paired branch. The second check is
+the one that sees a shape change made under an unchanged version stamp.
 
 ## Install
 

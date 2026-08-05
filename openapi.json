@@ -344,7 +344,7 @@
         "type": "object"
       },
       "ConfigSettingsView": {
-        "description": "`GET`/`PUT /config/settings` (1.5.0 full-config coverage) — the API-settable single-value config\noverlay (`root` section) and, on a PUT, the apply metadata. `settings` is the CURRENT effective\nroot override (the merge of prior overlay + this request). It is overlay-persisted so it survives\na restart WHEN a config overlay is configured (`BUSBAR_CONFIG_OVERLAY`) — a busbar with none\napplies the change live only, and `note` says so; `PUT` with `\"persist\": true` makes storage\nmandatory, refusing (`400`) rather than silently applying in memory when no overlay exists.\n`reload_to_apply` names the fields whose new value is DURABLY STORED but not yet LIVE: the\nprocess-level binds (`listen`/`admin_listen` socket, `tls`/`admin_tls` bind, `admin_insecure`) are\nread once at process start, and the durable `store` backend is reused across a hot reload — none\ncan hot-swap, so they take effect on the next RESTART (or a supervisor restart), NEVER on a\n`POST /config/reload` — a reload re-reads disk and rebuilds the `App` but does not rebind sockets,\nrebuild the TLS acceptor, or re-open the store. It is always EMPTY when nothing was durably stored\n(no overlay); `note` names the affected fields instead. Everything else\n(`rate_card`/`per_request_fee`/`security`/`advanced`/`metrics`/`health`/`routing`) is LIVE on the\nswap; `limits` is live EXCEPT four boot-scoped fields (see `reload_to_apply_fields`):\n`upstream_request_timeout_secs`/`pool_max_idle_per_host`/`pool_idle_timeout_secs`, which the\nreused `UpstreamClients` only reads once at boot, and `max_inbound_concurrent`, which is baked\nonce into the data router's `GlobalConcurrencyLimitLayer` at process start (a config apply swaps\nonly `Arc<App>`, never the router) — two independent freezing mechanisms. `observability` is live\nEXCEPT three boot-scoped fields: `emit_server_timing` (baked into router middleware state at\nboot), `request_log_webhook_url` (seeds a process-global `OnceLock` that no-ops after the first\n`main()` call), and `otlp_url` (feeds a one-shot `tracing_subscriber` init) — none rebuilt by an\napply.",
+        "description": "`GET`/`PUT /config/settings` (1.5.0 full-config coverage) — the API-settable single-value config\noverlay (`root` section) and, on a PUT, the apply metadata. `settings` is the CURRENT effective\nroot override (the merge of prior overlay + this request). It is overlay-persisted so it survives\na restart. 1.5.3: a MUTABLE config always has a writable `config.overlay` backend (the boot\ninvariant), so a successful PUT is ALWAYS durable; a LOCKED config (`config.locked: true`) refuses\nthe PUT (`400`) instead of applying it in memory only — the silent-loss outcome is gone.\n`reload_to_apply` names the fields whose new value is DURABLY STORED but not yet LIVE: the\nprocess-level binds (`listen`/`admin_listen` socket, `tls`/`admin_tls` bind, and the\n`admin_require_mtls` boot-guard) are read once at process start, and the durable `store` backend\nis reused across a hot reload — none can hot-swap, so they take effect on the next RESTART (or a\nsupervisor restart), NEVER on a\n`POST /config/reload` — a reload re-reads disk and rebuilds the `App` but does not rebind sockets,\nrebuild the TLS acceptor, or re-open the store. It is always EMPTY when nothing was durably stored\n(no overlay); `note` names the affected fields instead. Everything else\n(`rate_card`/`per_request_fee`/`security`/`health`/`routing`) is LIVE on the swap;\n`limits` is live EXCEPT four boot-scoped fields (see `reload_to_apply_fields`):\n`upstream_request_timeout_secs`/`pool_max_idle_per_host`/`pool_idle_timeout_secs`, which the\nreused `UpstreamClients` only reads once at boot, and `max_inbound_concurrent`, which is baked\nonce into the data router's `GlobalConcurrencyLimitLayer` at process start (a config apply swaps\nonly `Arc<App>`, never the router) — two independent freezing mechanisms. `observability` is live\nEXCEPT `otlp_url` (feeds a one-shot `tracing_subscriber` init, boot-frozen). (1.5.3: the\nrequest-log webhook + Prometheus metrics retired out of the single-value settings surface into the\nbuilt-in `export:` exporters, edited in `config.yaml` + applied via plugin reload.)\n`advanced` is live EXCEPT `response_headers` (task #139): `response_headers.server_timing` is\nbaked into router middleware state at boot (same \"config apply swaps `Arc<App>`, never the\nrouter\" freezing as `max_inbound_concurrent`) and `response_headers.route_policy` seeds a\nprocess-global `OnceLock` — neither rebuilt by an apply.",
         "properties": {
           "applied": {
             "description": "`true` on a PUT that stored + swapped; `false` on a GET (a pure read).",
@@ -370,7 +370,7 @@
             "type": "array"
           },
           "settings": {
-            "description": "The current effective root-section overlay (only the fields the operator has set; base\n`config.yaml` stands for the rest). An arbitrary JSON object (the `RootSettings` projection)."
+            "description": "The current effective root-section overlay (only the fields the operator has set; base\n`config.yaml` stands for the rest). An arbitrary JSON object (the `RootSettings` projection),\nREDACTED by `service::redact_settings_bags`: every opaque `settings:` bag inside it (today\n`store.settings`, whose `url` is a credential in busbar's own docs) appears as\n`settings_keys` — sorted key names, no values. Same on the GET and on the PUT echo.\n\nThis field NAME is frozen wire and is the response ENVELOPE member, not a plugin settings\nbag; the redaction applies to the bags nested INSIDE it."
           }
         },
         "required": [
@@ -903,11 +903,14 @@
         "type": "object"
       },
       "HookDesiredStatus": {
-        "description": "The DESIRED settings side of `hooks/{name}/status`: busbar's registry copy of the hook's settings\nand their version.",
+        "description": "The DESIRED settings side of `hooks/{name}/status`: busbar's registry copy of the hook's settings\n(KEY NAMES only — see [`super::HookView::settings_keys`]) and their version.",
         "properties": {
-          "settings": {
-            "additionalProperties": true,
-            "type": "object"
+          "settings_keys": {
+            "description": "Sorted KEY NAMES of the desired settings bag, never its values.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
           },
           "settings_version": {
             "format": "uint64",
@@ -916,7 +919,7 @@
           }
         },
         "required": [
-          "settings",
+          "settings_keys",
           "settings_version"
         ],
         "type": "object"
@@ -954,12 +957,15 @@
         "type": "object"
       },
       "HookReportedStatus": {
-        "description": "The REPORTED settings side of `hooks/{name}/status`: what the hook says it is actually running\n(present only when the hook answered `status`).",
+        "description": "The REPORTED settings side of `hooks/{name}/status`: what the hook says it is actually running\n(present only when the hook answered `status`).\n\nKEY NAMES only, and for a sharper reason than the desired side: the reported bag is the hook's\nECHO of the SECRET-RESOLVED settings busbar pushed it, i.e. the PLAINTEXT of every `SecretRef` —\nand this read is reachable at READ-ONLY admin scope. `null` when the hook answered `status` but\nreported no settings.",
         "properties": {
-          "settings": {
-            "additionalProperties": true,
+          "settings_keys": {
+            "description": "Sorted KEY NAMES of the observed settings bag, never its values.",
+            "items": {
+              "type": "string"
+            },
             "type": [
-              "object",
+              "array",
               "null"
             ]
           },
@@ -973,7 +979,7 @@
           }
         },
         "required": [
-          "settings",
+          "settings_keys",
           "settings_version"
         ],
         "type": "object"
@@ -1011,6 +1017,13 @@
               "null"
             ]
           },
+          "drift_keys": {
+            "description": "The DESIRED settings KEY NAMES the hook is not actually running — the actionable half of\n`drift`, carrying names this body already serves and no value from either bag. Invariantly an\narray (empty on the no-answer branch, where no drift is known).",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
           "metrics": {
             "description": "Validated + bounded self-reported metrics; each entry carries `{name, type, value}` and, when\nthe hook sent them, optional `labels`/`quantiles`/`estimated`/`ci_low`/`ci_high`/`help`/\n`label`/`unit`/`viz`/`max` members.\n\nE-004 (busbar-ui/docs/ENGINE-BUGS.md): schemars' blanket `JsonSchema` impl for\n`serde_json::Value` renders as the JSON-Schema-2020-12 boolean `true` (`schemars-1.2.1`'s\n`json_schema_impls/serdejson.rs`), which is legal 2020-12 but — nested here as this array's\n`items` — is a boolean SUB-schema, and `kin-openapi` (the parser under `oapi-codegen`, which\nevery published SDK generates through) cannot represent one at all: the parse aborts, taking\nout Python/TS/Go SDK regeneration simultaneously. `#[schemars(schema_with)]` overrides just\nthis field's schema to `{\"type\": \"array\", \"items\": {}}` — `{}` is the equivalent \"accepts\nanything\" schema every generator DOES understand, and is what busbar-ui's own\n`openapi-prep.py` already rewrites `items: true` into client-side. This is the only\n`items: true` in the document; every other `additionalProperties: true` schemars emits\nelsewhere is a boolean in a position `kin-openapi` handles fine and is deliberately untouched.",
             "items": {},
@@ -1046,6 +1059,7 @@
           "desired",
           "reported",
           "drift",
+          "drift_keys",
           "metrics",
           "as_of",
           "source"
@@ -1074,10 +1088,10 @@
         "type": "object"
       },
       "HookView": {
-        "description": "A hook definition in the registry read (`GET /api/v1/admin/hooks`, `GET /api/v1/admin/hooks/{name}`) — the\nplugin catalog read. Projects the DEFINITION (kind, transport, grants, ordering, stage), never a\nsecret. `global` reports whether the hook fires on every request (named in `global_hooks:` or\ndeclared `global: true`). Live connection status (`health`) is a separate endpoint. Additive-only.",
+        "description": "A hook definition in the registry read (`GET /api/v1/admin/hooks`, `GET /api/v1/admin/hooks/{name}`) — the\nplugin catalog read. Projects the DEFINITION (kind, transport, grants, ordering, stage), never a\nsecret — INCLUDING the `settings:` bag, which is projected as KEY NAMES only (see\n[`HookView::settings_keys`]). `global` reports whether the hook fires on every request (named in\n`global_hooks:` or declared `global: true`). Live connection status (`health`) is a separate\nendpoint. Additive-only.",
         "properties": {
           "at": {
-            "description": "TAP observation stage (`\"request\"`/`\"route\"`/`\"attempt\"`/`\"completion\"`), or `None` for a gate.",
+            "description": "TAP observation stage (`\"request\"`/`\"candidate\"`/`\"routing\"`/`\"response\"`), or `None` for a gate.",
             "type": [
               "string",
               "null"
@@ -1109,10 +1123,12 @@
             "description": "Prompt access grant: `\"no\"` | `\"ro\"` | `\"rw\"`.",
             "type": "string"
           },
-          "settings": {
-            "additionalProperties": true,
-            "description": "The hook's opaque settings map (operator/API-owned; pushed via the configure wire). Never\ninterpreted by busbar; never a secret by contract (hook settings are operator config).",
-            "type": "object"
+          "settings_keys": {
+            "description": "The KEY NAMES of the hook's opaque settings bag, sorted, WITHOUT their values — the same\nredacted projection [`NamedDefView::settings_keys`] carries, produced by the same helper.\n\nThis used to be the bag itself, under a doc comment claiming hook settings are \"never a\nsecret by contract\". That claim was retracted for `NamedDefView` and it is no more true here:\na hook's settings bag is a `SecretRef` carrier by design (`hooks::HookEnv::resolve_hook_settings`\nresolves it before every configure push), and `config::secret::resolve_settings` forwards a\nnon-object bag verbatim, so a literal credential is fully supported too. `GET /hooks` and\n`GET /hooks/{name}` serve this at READ-ONLY admin scope. The values are readable only where\nthey are writable — the config file and the config overlay.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
           },
           "timeout_ms": {
             "description": "Gate decision deadline in milliseconds.",
@@ -1138,7 +1154,7 @@
           "at",
           "on_error",
           "timeout_ms",
-          "settings",
+          "settings_keys",
           "global"
         ],
         "type": "object"
@@ -1150,7 +1166,7 @@
             "$ref": "#/components/schemas/BuildInfo"
           },
           "config_persistence": {
-            "description": "Whether config-overlay persistence is enabled (`BUSBAR_CONFIG_OVERLAY` set): `true` = API-applied\nconfig changes are durable across restarts; `false` = live-only (lost on restart). Lets tooling\ntell an operator whether their runtime changes will survive a restart.",
+            "description": "Whether config-overlay persistence is enabled — i.e. the config is MUTABLE with a writable\n`config.overlay` backend: `true` = API-applied config changes are durable across restarts;\n`false` = the config is LOCKED (`config.locked: true`) and admin-API config mutations are\nrefused. Lets tooling tell an operator whether runtime changes are accepted and durable.",
             "type": "boolean"
           },
           "config_version": {
@@ -1542,6 +1558,73 @@
         ],
         "type": "object"
       },
+      "NamedDefView": {
+        "description": "ONE definition of ONE 1.5.3 named-DEFINITION map — the read shape of the GENERIC named-map CRUD\n(`GET /api/v1/admin/identity-providers[/{name}]`, `GET /api/v1/admin/export[/{name}]`, and\n`tools:`/`agents:` when they land).\n\nDeliberately ONE view for every section rather than one per kind: the sections share the frozen\n`{module, settings}` spine and differ only by optional kind-specific fields, which are\n`skip_serializing_if`-omitted for a section that has none. So `/export` serves exactly\n`{name, module, settings_keys}` while `/identity-providers` additionally carries its ceiling —\nand a new section adds fields here (additive) instead of a parallel view + a parallel handler.\n\nSECRETS ARE NEVER PROJECTED, by construction — and that claim covers the `settings:` bag too,\nwhich is why this view carries `settings_keys` and NOT the bag itself. A `token:` is a SECRET\nREFERENCE collapsed to a boolean, and the module's opaque settings are a bag an operator\nlegitimately puts a credential VALUE in (an OIDC `client_secret`, a webhook `auth_header` value),\nso projecting it verbatim would hand every READ-ONLY admin credential the deployment's secrets\nthrough `GET /identity-providers/{name}` / `GET /export/{name}`. Projecting the KEY NAMES keeps\nthe introspection the read surface exists for (\"what is configured here?\") with no field a value\ncould ride out on — the same discipline `token_configured` already applies to the reference.",
+        "properties": {
+          "browser_login_configured": {
+            "description": "`identity-providers` ONLY: whether a `browser_login:` block is configured — the presence that\nputs a button on the hosted login page.",
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "max_admin_scope": {
+            "description": "`identity-providers` ONLY: the per-provider ADMIN CEILING (`none` | `read-only` | `full`).\n`None` ⇒ the definition names none, so the most restrictive default applies. Omitted entirely\nfor a section that carries no ceiling.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "module": {
+            "description": "The `module:` backing this instance (a built-in name or a signed-plugin name/alias).",
+            "type": "string"
+          },
+          "name": {
+            "description": "The instance NAME — the map key, and the token every reference site uses.",
+            "type": "string"
+          },
+          "settings_keys": {
+            "description": "The KEY NAMES of the module's opaque settings bag, sorted, WITHOUT their values — the\nredacted projection of `settings:`. Operator/API-owned and never interpreted here, but also\nnever a place a VALUE can leak from: a settings value may be a credential (see the type doc),\nand this surface is reachable at READ-ONLY admin scope. An empty bag ⇒ an empty list. The\nvalues are readable only where they are writable — the config file and the config overlay.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "token_configured": {
+            "description": "`identity-providers` ONLY: whether a `token:` secret REFERENCE is configured (the built-in\n`admin-tokens` operator credential). The reference itself is never projected.",
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "unparseable": {
+            "description": "Set ONLY on an entry that is STORED in the config overlay but could NOT be parsed into this\nsection's typed config by this binary (a downgrade whose struct lost a field, a hand-edited\noverlay) — the value is the parse error. Such an entry is dropped at every rebuild, so it is\nNOT live: `module`/`settings_keys` are the raw stored document's best-effort projection, not\na resolved definition. Present so the drop is DISCOVERABLE here rather than only in a boot\nlog line. Absent (and omitted from the body) for every live definition.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "name",
+          "module",
+          "settings_keys"
+        ],
+        "type": "object"
+      },
+      "NamedSettingsReq": {
+        "description": "The `PATCH /api/v1/admin/<section>/{name}/settings` body — the whole replacement settings bag.\nA sibling of the hooks surface's `PatchSettingsReq` (same shape, same semantics: `settings:` is\nREPLACED, not deep-merged, so the stored bag is always exactly what the caller sent).",
+        "properties": {
+          "settings": {
+            "additionalProperties": true,
+            "type": "object"
+          }
+        },
+        "required": [
+          "settings"
+        ],
+        "type": "object"
+      },
       "OverlayResetView": {
         "description": "`DELETE /overlay/{section}` — per-section overlay reset result: the section reverted, the\nresulting config version, and whether anything changed (`false` = the section had no overlay state,\nan idempotent no-op).",
         "properties": {
@@ -1616,6 +1699,28 @@
           "items": {
             "items": {
               "$ref": "#/components/schemas/ModelView"
+            },
+            "type": "array"
+          },
+          "next_cursor": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "items",
+          "next_cursor"
+        ],
+        "type": "object"
+      },
+      "Page_NamedDefView": {
+        "description": "A cursor-paginated list envelope. `items` is this page; `next_cursor` is `Some` when more remain.\nGeneric over the item view so every list endpoint shares one shape.",
+        "properties": {
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/NamedDefView"
             },
             "type": "array"
           },
@@ -3489,7 +3594,7 @@
             "application/json": {
               "schema": {
                 "additionalProperties": true,
-                "description": "The settings sections to replace, keyed by section name. The optional top-level boolean `persist` asserts the change MUST be stored in the config overlay: with `persist: true` a busbar that has no overlay refuses with `400 invalid_request` instead of applying the change in memory only. Omitted or `false` means the change is applied and stored where storage is available, and applied in memory only where it is not (the response `note` says which); `false` never suppresses storage. Every other top-level key must be a known settings section — an unknown key is a 400. The accepted shape is the config file's own, documented in the configuration reference; it is not restated here because several of its types parse a wire shape that does not match their field layout.",
+                "description": "The settings sections to replace, keyed by section name. Durable by default (1.5.3): a mutable config always stores the change in its overlay (survives restart), and a locked config (`config.locked: true`) refuses ANY change with `400`. There is no \"apply in memory only\" outcome. The optional top-level boolean `persist` is accepted for back-compat and boolean-validated (a non-boolean is a 400 naming the field), but its value has NO effect — persistence is unconditional on a mutable config and refusal is unconditional on a locked one. Every other top-level key must be a known settings section — an unknown key is a 400. The accepted shape is the config file's own, documented in the configuration reference; it is not restated here because several of its types parse a wire shape that does not match their field layout.",
                 "type": "object"
               }
             }
@@ -3576,7 +3681,7 @@
             "bearerAuth": []
           }
         ],
-        "summary": "SET any single-value config section durably (1.5.0 full-config coverage): partial RootSettings merged onto the overlay, re-resolved + validated, swapped in. rate_card/per_request_fee/security/limits/… go live; listen/tls/admin_listen/admin_tls/admin_insecure/store are stored + flagged restart-to-apply (bound once at start / store reused across a hot reload). NEVER writes config.yaml",
+        "summary": "SET any single-value config section durably (1.5.0 full-config coverage): partial RootSettings merged onto the overlay, re-resolved + validated, swapped in. rate_card/per_request_fee/security/limits/… go live; listen/tls/admin_listen/admin_tls/admin_require_mtls/store are stored + flagged restart-to-apply (bound once at start / store reused across a hot reload). NEVER writes config.yaml",
         "x-busbar-required-scope": "full"
       }
     },
@@ -3856,6 +3961,489 @@
         ],
         "summary": "One retained config version, with its hook-surface snapshot",
         "x-busbar-required-scope": "read-only"
+      }
+    },
+    "/api/v1/admin/export": {
+      "get": {
+        "operationId": "GetExport",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Page_NamedDefView"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Missing/invalid admin credential (error code `unauthorized`)"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Authenticated but under-scoped: requires `read-only` (error code `forbidden`)"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Internal failure (error code `internal`); the detail is logged server-side, never returned"
+          }
+        },
+        "security": [
+          {
+            "adminToken": []
+          },
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Every `export:` DEFINITION (the 1.5.3 named-definition map: name -> {module, settings, ...}, referenced by bare name). Secrets are never projected",
+        "x-busbar-required-scope": "read-only"
+      }
+    },
+    "/api/v1/admin/export/{name}": {
+      "delete": {
+        "operationId": "DeleteExportName",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Optimistic concurrency: the resource's ETag from a prior read (or the ETag returned by the previous mutation). Stale = 409 `version_conflict` (re-read and retry), nothing changes; absent or `*` = unconditional.",
+            "in": "header",
+            "name": "If-Match",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Removed"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "`invalid_request`: malformed `If-Match` header, ephemeral busbar: no disk config to read, merge onto, or revert to"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Missing/invalid admin credential (error code `unauthorized`)"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Authenticated but under-scoped: requires `full` (error code `forbidden`)"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "`not_found`: unknown resource"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "`conflict`: base-defined (edit config.yaml) | `version_conflict`: stale `If-Match` (re-read and retry)"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Per-principal mutation budget exhausted (error code `rate_limited`; `Retry-After` header)"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Internal failure (error code `internal`); the detail is logged server-side, never returned"
+          }
+        },
+        "security": [
+          {
+            "adminToken": []
+          },
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Remove one `export:` definition — refused while another config section still references it by bare name",
+        "x-busbar-required-scope": "full"
+      },
+      "get": {
+        "operationId": "GetExportName",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/NamedDefView"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Missing/invalid admin credential (error code `unauthorized`)"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Authenticated but under-scoped: requires `read-only` (error code `forbidden`)"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "`not_found`: unknown resource"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Internal failure (error code `internal`); the detail is logged server-side, never returned"
+          }
+        },
+        "security": [
+          {
+            "adminToken": []
+          },
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "One `export:` definition",
+        "x-busbar-required-scope": "read-only"
+      },
+      "put": {
+        "operationId": "PutExportName",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Optimistic concurrency: the resource's ETag from a prior read (or the ETag returned by the previous mutation). Stale = 409 `version_conflict` (re-read and retry), nothing changes; absent or `*` = unconditional.",
+            "in": "header",
+            "name": "If-Match",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "additionalProperties": true,
+                "description": "One `export:` DEFINITION, exactly as config.yaml spells it (`{module, settings, ...}`). Parsed into the section's `deny_unknown_fields` config struct, so an unknown key is the same loud reject the file would give. The accepted shape is the config file's own, documented in the configuration reference; it is not restated here because several of its types parse a wire shape that does not match their field layout.",
+                "type": "object"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/NamedDefView"
+                }
+              }
+            },
+            "description": "The stored exporter definition. Additionally carries `reload_to_apply` (+ a `note`) when the mutation declared a plugin ROUTE this process cannot serve: each route path is registered on the HTTP router once, at process start, and an apply swaps only the config snapshot, so a path that did not exist at boot (e.g. `/metrics` for a first `prometheus` exporter) answers 404 until the next RESTART. Both fields are omitted when nothing is pending"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "`invalid_request`: malformed body / unknown field, malformed `If-Match` header, invalid config; nothing changed, ephemeral busbar: no disk config to read, merge onto, or revert to"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Missing/invalid admin credential (error code `unauthorized`)"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Authenticated but under-scoped: requires `full` (error code `forbidden`)"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "`conflict`: base-defined (edit config.yaml) | `version_conflict`: stale `If-Match` (re-read and retry)"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Per-principal mutation budget exhausted (error code `rate_limited`; `Retry-After` header)"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Internal failure (error code `internal`); the detail is logged server-side, never returned"
+          }
+        },
+        "security": [
+          {
+            "adminToken": []
+          },
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Create or REPLACE one `export:` definition (upsert) — persisted to the config overlay and live after an atomic rebuild-and-swap. A base-config-defined entry is 409 (edit config.yaml)",
+        "x-busbar-required-scope": "full"
+      }
+    },
+    "/api/v1/admin/export/{name}/settings": {
+      "patch": {
+        "operationId": "PatchExportNameSettings",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Optimistic concurrency: the resource's ETag from a prior read (or the ETag returned by the previous mutation). Stale = 409 `version_conflict` (re-read and retry), nothing changes; absent or `*` = unconditional.",
+            "in": "header",
+            "name": "If-Match",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/NamedSettingsReq"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/NamedDefView"
+                }
+              }
+            },
+            "description": "The updated exporter definition (same `reload_to_apply` restart signal as the PUT, when the mutation declares a route the router lacks)"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "`invalid_request`: malformed body / unknown field, malformed `If-Match` header, invalid config; nothing changed, ephemeral busbar: no disk config to read, merge onto, or revert to"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Missing/invalid admin credential (error code `unauthorized`)"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Authenticated but under-scoped: requires `full` (error code `forbidden`)"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "`not_found`: unknown resource"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "`conflict`: base-defined (edit config.yaml) | `version_conflict`: stale `If-Match` (re-read and retry)"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Per-principal mutation budget exhausted (error code `rate_limited`; `Retry-After` header)"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Internal failure (error code `internal`); the detail is logged server-side, never returned"
+          }
+        },
+        "security": [
+          {
+            "adminToken": []
+          },
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Replace ONLY the opaque `settings:` bag of one `export:` definition; every other field is left byte-identical",
+        "x-busbar-required-scope": "full"
       }
     },
     "/api/v1/admin/groups": {
@@ -5462,6 +6050,489 @@
         ],
         "summary": "The hook's OBSERVED state, live-queried: running settings + version (vs busbar's desired copy, with a drift verdict) and self-reported metrics. reported=null when the hook doesn't answer (fail-open)",
         "x-busbar-required-scope": "read-only"
+      }
+    },
+    "/api/v1/admin/identity-providers": {
+      "get": {
+        "operationId": "GetIdentityProviders",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Page_NamedDefView"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Missing/invalid admin credential (error code `unauthorized`)"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Authenticated but under-scoped: requires `read-only` (error code `forbidden`)"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Internal failure (error code `internal`); the detail is logged server-side, never returned"
+          }
+        },
+        "security": [
+          {
+            "adminToken": []
+          },
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Every `identity-providers:` DEFINITION (the 1.5.3 named-definition map: name -> {module, settings, ...}, referenced by bare name). Secrets are never projected",
+        "x-busbar-required-scope": "read-only"
+      }
+    },
+    "/api/v1/admin/identity-providers/{name}": {
+      "delete": {
+        "operationId": "DeleteIdentityProvidersName",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Optimistic concurrency: the resource's ETag from a prior read (or the ETag returned by the previous mutation). Stale = 409 `version_conflict` (re-read and retry), nothing changes; absent or `*` = unconditional.",
+            "in": "header",
+            "name": "If-Match",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Removed"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "`invalid_request`: malformed `If-Match` header, ephemeral busbar: no disk config to read, merge onto, or revert to"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Missing/invalid admin credential (error code `unauthorized`)"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Authenticated but under-scoped: requires `full` (error code `forbidden`)"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "`not_found`: unknown resource"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "`conflict`: base-defined (edit config.yaml), another config section still references this definition by bare name (remove the reference first) | `version_conflict`: stale `If-Match` (re-read and retry)"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Per-principal mutation budget exhausted (error code `rate_limited`; `Retry-After` header)"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Internal failure (error code `internal`); the detail is logged server-side, never returned"
+          }
+        },
+        "security": [
+          {
+            "adminToken": []
+          },
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Remove one `identity-providers:` definition — refused while another config section still references it by bare name",
+        "x-busbar-required-scope": "full"
+      },
+      "get": {
+        "operationId": "GetIdentityProvidersName",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/NamedDefView"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Missing/invalid admin credential (error code `unauthorized`)"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Authenticated but under-scoped: requires `read-only` (error code `forbidden`)"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "`not_found`: unknown resource"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Internal failure (error code `internal`); the detail is logged server-side, never returned"
+          }
+        },
+        "security": [
+          {
+            "adminToken": []
+          },
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "One `identity-providers:` definition",
+        "x-busbar-required-scope": "read-only"
+      },
+      "put": {
+        "operationId": "PutIdentityProvidersName",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Optimistic concurrency: the resource's ETag from a prior read (or the ETag returned by the previous mutation). Stale = 409 `version_conflict` (re-read and retry), nothing changes; absent or `*` = unconditional.",
+            "in": "header",
+            "name": "If-Match",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "additionalProperties": true,
+                "description": "One `identity-providers:` DEFINITION, exactly as config.yaml spells it (`{module, settings, ...}`). Parsed into the section's `deny_unknown_fields` config struct, so an unknown key is the same loud reject the file would give. The accepted shape is the config file's own, documented in the configuration reference; it is not restated here because several of its types parse a wire shape that does not match their field layout.",
+                "type": "object"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/NamedDefView"
+                }
+              }
+            },
+            "description": "The stored identity-provider definition. Additionally carries `reload_to_apply` (+ a `note`) when the mutation declared a plugin ROUTE this process cannot serve: each route path is registered on the HTTP router once, at process start, and an apply swaps only the config snapshot, so a path that did not exist at boot (e.g. `/metrics` for a first `prometheus` exporter) answers 404 until the next RESTART. Both fields are omitted when nothing is pending"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "`invalid_request`: malformed body / unknown field, malformed `If-Match` header, invalid config; nothing changed, ephemeral busbar: no disk config to read, merge onto, or revert to"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Missing/invalid admin credential (error code `unauthorized`)"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Authenticated but under-scoped: requires `full` (error code `forbidden`)"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "`conflict`: base-defined (edit config.yaml), raising `max_admin_scope` is refused over the admin API — the trust ceiling is operator file policy; lower it here, raise it in config.yaml | `version_conflict`: stale `If-Match` (re-read and retry)"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Per-principal mutation budget exhausted (error code `rate_limited`; `Retry-After` header)"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Internal failure (error code `internal`); the detail is logged server-side, never returned"
+          }
+        },
+        "security": [
+          {
+            "adminToken": []
+          },
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Create or REPLACE one `identity-providers:` definition (upsert) — persisted to the config overlay and live after an atomic rebuild-and-swap. A base-config-defined entry is 409 (edit config.yaml); RAISING `max_admin_scope` is refused outright (the trust ceiling is operator file policy)",
+        "x-busbar-required-scope": "full"
+      }
+    },
+    "/api/v1/admin/identity-providers/{name}/settings": {
+      "patch": {
+        "operationId": "PatchIdentityProvidersNameSettings",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Optimistic concurrency: the resource's ETag from a prior read (or the ETag returned by the previous mutation). Stale = 409 `version_conflict` (re-read and retry), nothing changes; absent or `*` = unconditional.",
+            "in": "header",
+            "name": "If-Match",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/NamedSettingsReq"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/NamedDefView"
+                }
+              }
+            },
+            "description": "The updated identity-provider definition (same `reload_to_apply` restart signal as the PUT, when the mutation declares a route the router lacks)"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "`invalid_request`: malformed body / unknown field, malformed `If-Match` header, invalid config; nothing changed, ephemeral busbar: no disk config to read, merge onto, or revert to"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Missing/invalid admin credential (error code `unauthorized`)"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Authenticated but under-scoped: requires `full` (error code `forbidden`)"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "`not_found`: unknown resource"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "`conflict`: base-defined (edit config.yaml) | `version_conflict`: stale `If-Match` (re-read and retry)"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Per-principal mutation budget exhausted (error code `rate_limited`; `Retry-After` header)"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Internal failure (error code `internal`); the detail is logged server-side, never returned"
+          }
+        },
+        "security": [
+          {
+            "adminToken": []
+          },
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Replace ONLY the opaque `settings:` bag of one `identity-providers:` definition; every other field is left byte-identical",
+        "x-busbar-required-scope": "full"
       }
     },
     "/api/v1/admin/info": {
@@ -7502,7 +8573,7 @@
             "bearerAuth": []
           }
         ],
-        "summary": "Restart busbar to apply the restart-scoped settings (listen, admin_listen, tls, admin_tls, admin_insecure, store). Drains first; the supervisor brings it back",
+        "summary": "Restart busbar to apply the restart-scoped settings (listen, admin_listen, tls, admin_tls, admin_require_mtls, store). Drains first; the supervisor brings it back",
         "x-busbar-required-scope": "full"
       }
     },

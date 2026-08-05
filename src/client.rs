@@ -2,7 +2,10 @@
 //!
 //! The request/response structs below mirror the frozen v1 contract
 //! (`crates/busbar/src/admin/v1/contract`; the committed `openapi.json` at the repo root is the
-//! canonical spec this client was audited against — busbar 1.5.2). Only the fields busbar-admin actually renders are
+//! canonical spec this client is audited against, refreshed from core's generated document). The
+//! audit is not a one-off: `spec_contract_tests` below re-runs it on every `cargo test`, against
+//! the committed spec locally and against core's PAIRED spec in CI, so a shape change made under
+//! an unchanged version stamp cannot pass unnoticed. Only the fields busbar-admin renders are
 //! modelled; unknown fields are ignored (the contract is additive-only), so a newer gateway never
 //! breaks an older CLI. To add an endpoint: add a typed response struct and a method on
 //! [`Client`] that calls [`Client::get`] / [`Client::send`] with the relative path — every method
@@ -476,8 +479,16 @@ pub struct PluginView {
     pub loader: String,
     #[serde(default)]
     pub active: Option<bool>,
+    /// For a dynamic-library plugin, its NAME — NOT a socket path or URL (that was the retired
+    /// 1.4.x transport target). `null` for a compiled-in row.
+    #[serde(default)]
+    pub target: Option<String>,
     #[serde(default)]
     pub file: Option<String>,
+    /// The C-ABI version the manifest declares — the operator-facing name for the ABI the engine
+    /// speaks. `null` for a compiled-in row or a plugin with no manifest.
+    #[serde(default)]
+    pub interface_version: Option<u32>,
     #[serde(default)]
     pub version: Option<String>,
     #[serde(default)]
@@ -515,6 +526,9 @@ pub struct InstallPluginReq {
 pub struct PluginInstallView {
     pub file: String,
     pub name: String,
+    /// The C-ABI version the installed manifest declares (see [`PluginView::interface_version`]).
+    #[serde(default)]
+    pub interface_version: Option<u32>,
     #[serde(default)]
     pub version: Option<String>,
     #[serde(default)]
@@ -591,6 +605,15 @@ pub struct HookView {
     pub on_error: String,
     #[serde(default)]
     pub timeout_ms: u64,
+    /// The KEY NAMES of the hook's opaque `settings:` bag, sorted, WITHOUT their values.
+    ///
+    /// This field USED to be the bag itself. A hook's settings bag is a secret-reference carrier
+    /// by design and a literal credential in it is fully supported, while `GET /hooks` is served
+    /// at READ-ONLY admin scope — so the gateway now projects key names only, and this client
+    /// models the redacted projection. Reading the bag verbatim is not something a newer gateway
+    /// will do, and this CLI must not model a shape that would invite it back.
+    #[serde(default)]
+    pub settings_keys: Vec<String>,
     #[serde(default)]
     pub global: bool,
 }
@@ -611,13 +634,397 @@ pub struct HookPage {
     pub next_cursor: Option<String>,
 }
 
+/// STRUCTURAL spec-contract check — the thing the `spec-drift` CI job could not see.
+///
+/// `spec-drift` compares `openapi.json`'s `info.version` against the latest busbar release, so it
+/// is blind to any shape change made under an UNCHANGED version stamp. That is not hypothetical:
+/// core `dev` and this repo's committed copy are both stamped 1.5.2 while core has already renamed
+/// the hook `settings` bag to `settings_keys` (a redaction fix) on `HookView`, `HookDesiredStatus`
+/// and `HookReportedStatus`, and added `drift_keys` to `HookStatusView`. A version-only check can
+/// never go red on that, and a check that cannot fail is not a check.
+///
+/// This module closes the gap by comparing the structs in this file against the SPEC DOCUMENT,
+/// field by field, in both directions:
+///
+///   * **no phantom fields** — every field this client models must exist in the schema. This is
+///     the anti-RENAME arm: `settings` → `settings_keys` goes red here.
+///   * **no ignored REQUIRED fields** — every field the schema marks `required` must be modelled,
+///     unless it is named in [`DELIBERATELY_UNRENDERED`] with a written reason. This is the
+///     anti-BLIND-SPOT arm: core adding a required field this CLI silently drops goes red, and the
+///     only way to quiet it is to record the decision.
+///
+/// The modelled field set is not a hand-maintained list — it is derived by SERIALIZING a real
+/// instance of each struct, so the table cannot drift away from the types it claims to describe.
+///
+/// **Which document.** By default the committed `openapi.json`. Set `BUSBAR_SPEC` to a path and
+/// the same assertions run against that document instead — which is how CI runs this, BLOCKING,
+/// against core at the run's branch. That paired run is consumption-scoped, so core racing ahead
+/// with new endpoints and new optional fields does NOT turn it red (the failure mode that forced
+/// the whole-document diff to be non-blocking); only a REMOVAL, a RENAME, or a new REQUIRED field
+/// this client ignores can fail it.
+#[cfg(test)]
+mod spec_contract_tests {
+    use super::*;
+    use std::collections::BTreeSet;
+
+    /// Fields a schema marks REQUIRED that this CLI deliberately does not model, each with the
+    /// reason it is safe to ignore. Entries are `(schema, field, why)`. Anything not listed here
+    /// that core marks required will fail the test — the point is that dropping a required field
+    /// becomes a recorded decision instead of a silent one.
+    const DELIBERATELY_UNRENDERED: &[(&str, &str, &str)] = &[
+        // `GET /hooks` is a definition listing; the live desired-vs-reported settings comparison is
+        // `GET /hooks/{name}/status`, a separate endpoint this CLI does not surface yet. The key
+        // NAMES are modelled anyway (cheap, and it keeps the rename arm honest), so this entry is
+        // currently empty — kept as the documented seam for the next one.
+    ];
+
+    fn spec() -> serde_json::Value {
+        let path = std::env::var("BUSBAR_SPEC")
+            .unwrap_or_else(|_| concat!(env!("CARGO_MANIFEST_DIR"), "/openapi.json").to_string());
+        let raw = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("reading the OpenAPI document at {path}: {e}"));
+        serde_json::from_str(&raw)
+            .unwrap_or_else(|e| panic!("parsing the OpenAPI document at {path}: {e}"))
+    }
+
+    /// The field names a struct actually puts on (or reads off) the wire, taken from its own
+    /// `Serialize` impl rather than from a list someone has to remember to update.
+    fn modelled<T: Serialize>(v: &T) -> BTreeSet<String> {
+        serde_json::to_value(v)
+            .expect("a contract struct must serialize")
+            .as_object()
+            .expect("a contract struct must serialize to a JSON object")
+            .keys()
+            .cloned()
+            .collect()
+    }
+
+    fn schema_fields(spec: &serde_json::Value, name: &str) -> (BTreeSet<String>, BTreeSet<String>) {
+        let s = spec
+            .pointer(&format!("/components/schemas/{name}"))
+            .unwrap_or_else(|| panic!("schema {name} is absent from the OpenAPI document"));
+        let props = s
+            .get("properties")
+            .and_then(|p| p.as_object())
+            .map(|o| o.keys().cloned().collect())
+            .unwrap_or_default();
+        let required = s
+            .get("required")
+            .and_then(|r| r.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default();
+        (props, required)
+    }
+
+    /// Assert one struct against one schema, in both directions.
+    fn assert_matches<T: Serialize>(spec: &serde_json::Value, schema: &str, instance: &T) {
+        let modelled = modelled(instance);
+        let (props, required) = schema_fields(spec, schema);
+
+        let phantom: Vec<_> = modelled.difference(&props).cloned().collect();
+        assert!(
+            phantom.is_empty(),
+            "{schema}: this client models {phantom:?}, which the spec does NOT have — a renamed \
+             or removed field. The client is speaking a language the gateway no longer accepts."
+        );
+
+        let ignored: Vec<_> = required
+            .difference(&modelled)
+            .filter(|f| {
+                !DELIBERATELY_UNRENDERED
+                    .iter()
+                    .any(|(s, field, _)| *s == schema && field == &f.as_str())
+            })
+            .cloned()
+            .collect();
+        assert!(
+            ignored.is_empty(),
+            "{schema}: the spec marks {ignored:?} REQUIRED but this client does not model them. \
+             Either model them or record why not in DELIBERATELY_UNRENDERED."
+        );
+    }
+
+    // ── Instances. Every field is populated so nothing is `skip_serializing_if`-omitted; the
+    //    compiler forces this list to track the structs, which is the point.
+
+    fn sample_key_view() -> KeyView {
+        KeyView {
+            id: "vk_1".into(),
+            name: "n".into(),
+            allowed_pools: None,
+            group: None,
+            labels: Default::default(),
+            state: "active".into(),
+            enabled: true,
+            created_at: 0,
+        }
+    }
+
+    #[test]
+    fn info_shapes_match_the_spec() {
+        let spec = spec();
+        assert_matches(
+            &spec,
+            "InfoView",
+            &InfoView {
+                version: "1.5.2".into(),
+                build: BuildInfo {
+                    auth_modules: vec![],
+                    hook_plugins: vec![],
+                    weighted_floor: false,
+                },
+                uptime_seconds: Some(0),
+                started_at: Some(0),
+                topology: TopologyInfo {
+                    pools: 0,
+                    models: 0,
+                    providers: 0,
+                },
+                config_persistence: false,
+                config_version: 0,
+            },
+        );
+        assert_matches(
+            &spec,
+            "BuildInfo",
+            &BuildInfo {
+                auth_modules: vec![],
+                hook_plugins: vec![],
+                weighted_floor: false,
+            },
+        );
+        assert_matches(
+            &spec,
+            "TopologyInfo",
+            &TopologyInfo {
+                pools: 0,
+                models: 0,
+                providers: 0,
+            },
+        );
+    }
+
+    #[test]
+    fn key_shapes_match_the_spec() {
+        let spec = spec();
+        assert_matches(&spec, "KeyView", &sample_key_view());
+        assert_matches(
+            &spec,
+            "KeyPageView",
+            &KeyPage {
+                items: vec![],
+                next_cursor: None,
+            },
+        );
+        assert_matches(
+            &spec,
+            "CreateKeyReq",
+            &CreateKeyReq {
+                name: "svc".into(),
+                allowed_pools: Some(vec![]),
+                group: Some("g".into()),
+                parent: Some("p".into()),
+                expires_in: Some("7d".into()),
+                expires_at: Some(0),
+                labels: [("k".to_string(), "v".to_string())].into_iter().collect(),
+                issue_aws_credential: true,
+            },
+        );
+        assert_matches(
+            &spec,
+            "CreatedKeyView",
+            &CreatedKeyView {
+                id: "vk_1".into(),
+                name: "n".into(),
+                allowed_pools: None,
+                group: None,
+                labels: Default::default(),
+                state: "active".into(),
+                enabled: true,
+                created_at: 0,
+                token: "bbk".into(),
+                expires_at: 0,
+                group_provisioned: false,
+                aws_access_key_id: None,
+                aws_secret_access_key: None,
+            },
+        );
+        assert_matches(
+            &spec,
+            "RotatedKeyView",
+            &RotatedKeyView {
+                id: "vk_1".into(),
+                name: "n".into(),
+                allowed_pools: None,
+                group: None,
+                labels: Default::default(),
+                state: "active".into(),
+                enabled: true,
+                created_at: 0,
+                token: None,
+                expires_at: None,
+                secret: None,
+            },
+        );
+        assert_matches(
+            &spec,
+            "RevokeView",
+            &RevokeView {
+                revoked: "vk_1".into(),
+            },
+        );
+    }
+
+    fn sample_plugin_view() -> PluginView {
+        PluginView {
+            name: "p".into(),
+            plugin_type: "hooks".into(),
+            loader: "plugin".into(),
+            active: Some(true),
+            target: Some("p".into()),
+            file: Some("p.tar.gz".into()),
+            interface_version: Some(1),
+            version: Some("1.0.0".into()),
+            publisher: Some("acme".into()),
+            trust: Some("trusted".into()),
+            valid: Some(true),
+            error: None,
+            has_schema: true,
+        }
+    }
+
+    #[test]
+    fn plugin_shapes_match_the_spec() {
+        let spec = spec();
+        assert_matches(&spec, "PluginView", &sample_plugin_view());
+        assert_matches(
+            &spec,
+            "Page_PluginView",
+            &PluginPage {
+                items: vec![],
+                next_cursor: None,
+            },
+        );
+        assert_matches(
+            &spec,
+            "InstallPluginReq",
+            &InstallPluginReq {
+                file: "p.tar.gz".into(),
+                tarball_b64: "AA==".into(),
+            },
+        );
+        assert_matches(
+            &spec,
+            "InspectPluginReq",
+            &InspectPluginReq {
+                file: "p.tar.gz".into(),
+                tarball_b64: "AA==".into(),
+            },
+        );
+        assert_matches(
+            &spec,
+            "PluginInstallView",
+            &PluginInstallView {
+                file: "p.tar.gz".into(),
+                name: "p".into(),
+                interface_version: Some(1),
+                version: Some("1.0.0".into()),
+                publisher: Some("acme".into()),
+                trust: "trusted".into(),
+                note: String::new(),
+            },
+        );
+        assert_matches(
+            &spec,
+            "PluginSchemaView",
+            &InspectView {
+                name: "p".into(),
+                version: Some("1.0.0".into()),
+                kind: Some("store".into()),
+                trust: "trusted".into(),
+                source: "manifest".into(),
+                restart_required_default: Some(true),
+                schema: None,
+                schema_error: None,
+            },
+        );
+        assert_matches(
+            &spec,
+            "PluginReloadView",
+            &PluginReloadView {
+                plugins: vec![],
+                note: String::new(),
+            },
+        );
+    }
+
+    #[test]
+    fn hook_shapes_match_the_spec() {
+        let spec = spec();
+        assert_matches(
+            &spec,
+            "HookView",
+            &HookView {
+                name: "h".into(),
+                kind: "gate".into(),
+                transport: HookTransportView {
+                    kind: "plugin".into(),
+                    target: Some("t".into()),
+                },
+                prompt: "ro".into(),
+                user: "no".into(),
+                priority: 0,
+                at: Some("request".into()),
+                on_error: "reject".into(),
+                timeout_ms: 0,
+                settings_keys: vec!["api_key".into()],
+                global: false,
+            },
+        );
+        assert_matches(
+            &spec,
+            "HookTransportView",
+            &HookTransportView {
+                kind: "plugin".into(),
+                target: Some("t".into()),
+            },
+        );
+        assert_matches(
+            &spec,
+            "Page_HookView",
+            &HookPage {
+                items: vec![],
+                next_cursor: None,
+            },
+        );
+    }
+
+    #[test]
+    fn config_shapes_match_the_spec() {
+        assert_matches(
+            &spec(),
+            "ConfigApplyView",
+            &ConfigApplyView {
+                applied: true,
+                config_version: 0,
+                note: String::new(),
+            },
+        );
+    }
+}
+
 #[cfg(test)]
 mod spec_shape_tests {
-    // These lock the 1.5.2 wire shapes this crate was realigned to (commit that repaired the
-    // 1.4.x drift). The spec-drift CI job only checks the committed openapi.json's VERSION string;
-    // it does NOT check that these structs still match the spec's schemas. Without these, a
-    // rebase reintroducing a 1.4.x field, or flipping `allowed_pools` back to a non-Option Vec,
-    // compiles clean and ships — exactly the regression class the realignment fixed.
+    // These lock wire SEMANTICS that a field-name comparison cannot express. `spec_contract_tests`
+    // above proves the field NAMES match the spec; these prove the meanings do — that a null
+    // `allowed_pools` is all-pools rather than none, that the once-shown credential is the signed
+    // `token` and not the 1.4.x `secret`, that an all-defaults `CreateKeyReq` serializes to exactly
+    // `{name}` against a server that rejects unknown fields. A rebase reintroducing a 1.4.x field,
+    // or flipping `allowed_pools` back to a non-Option Vec, compiles clean and ships without these.
     use super::*;
 
     #[test]
