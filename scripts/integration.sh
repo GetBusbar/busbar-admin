@@ -1,10 +1,15 @@
 #!/usr/bin/env bash
 # End-to-end integration test: boot a REAL busbar gateway and drive EVERY busbar-admin command
 # against it, asserting real effects — the same "prove it works against a real busbar" bar the
-# plugin repos hold themselves to. Bidirectional by design:
-#   - busbar-admin's own CI runs this against the latest RELEASED busbar (catches CLIENT drift).
-#   - busbar core's dev-gate runs this against the FRESHLY-BUILT busbar (catches ENGINE drift that
-#     would break the admin client) — the reverse of how core tests each plugin.
+# plugin repos hold themselves to. Bidirectional by design, and driven against THREE engines:
+#   - busbar-admin's CI `integration` job: the PAIRED engine — core checked out at the SAME BRANCH
+#     as this run and built from source. This is the gate that blocks the release train; it proves
+#     "this client works with the engine it will ship beside".
+#   - busbar-admin's CI `integration-released` job: the last RELEASED busbar. Answers the different
+#     and equally real question "does the client work with the gateway users actually have today?".
+#     Non-blocking by design — it may legitimately go red mid-cycle.
+#   - busbar core's own qa-gate runs this against its FRESHLY-BUILT busbar (catches ENGINE drift
+#     that would break the admin client) — the reverse of how core tests each plugin.
 #
 # Usage: integration.sh <busbar-binary> <busbar-admin-binary>
 # Both must be executable. Uses ports 19080/19081 on localhost; override with BUSBAR_ITEST_PORT /
@@ -36,7 +41,21 @@ EOF
 # guidance -> stderr) into a file and reference it as a {file:} secret ref, as an operator would.
 "$BUSBAR_BIN" --generate-signing-key > "$WORK/signing.key" 2>/dev/null
 [ -s "$WORK/signing.key" ] || { echo "--generate-signing-key produced no key" >&2; exit 1; }
-cat > "$BUSBAR_CONFIG" <<EOF
+# ── admin-auth config grammar: PROBED, never assumed ──────────────────────────────────────────
+# The admin-token provider is declared two incompatible ways depending on the engine:
+#   1.5.3+ : define once under top-level `identity-providers:`, reference by BARE NAME from
+#            `auth.admin_auth:`. The inline form is RETIRED and fail-closes at boot.
+#   ≤1.5.2 : the inline `auth.admin_auth: [- admin-tokens: {…}]` entry form. The top-level
+#            `identity-providers:` key does not exist and is rejected as an unknown field.
+# This script is run against BOTH (the paired same-branch engine and the last released one), so it
+# cannot hard-code either. `busbar --version` cannot discriminate — core `dev` carried the 1.5.3
+# grammar while still reporting `busbar 1.5.2` — so this is a real CAPABILITY probe: write the
+# modern form, ask the engine's own `--validate` (no server, no network, no state), and fall back
+# ONLY on the exact "unknown field `identity-providers`" rejection. Any other validation error is
+# a genuine failure and is surfaced as one.
+write_config() { # $1 = admin_auth grammar: modern | legacy
+  if [ "$1" = modern ]; then
+    cat > "$BUSBAR_CONFIG" <<EOF
 listen: "127.0.0.1:${PORT}"
 admin_listen: "127.0.0.1:${ADMIN_PORT}"
 identity-providers:
@@ -52,6 +71,43 @@ models:
   m:
     provider: mock
 EOF
+  else
+    cat > "$BUSBAR_CONFIG" <<EOF
+listen: "127.0.0.1:${PORT}"
+admin_listen: "127.0.0.1:${ADMIN_PORT}"
+auth:
+  chain: [keys]
+  signing_key: { file: "${WORK}/signing.key" }
+  admin_auth:
+    - admin-tokens: { token: { env: BUSBAR_ADMIN_TOKEN } }
+providers:
+  mock:
+    api_key: { env: MOCK_KEY }
+models:
+  m:
+    provider: mock
+EOF
+  fi
+}
+
+GRAMMAR=modern
+write_config modern
+if ! "$BUSBAR_BIN" --validate > "$WORK/validate.log" 2>&1; then
+  if grep -q 'unknown field `identity-providers`' "$WORK/validate.log"; then
+    GRAMMAR=legacy
+    write_config legacy
+    if ! "$BUSBAR_BIN" --validate > "$WORK/validate.log" 2>&1; then
+      echo "neither admin_auth grammar validates against this busbar:" >&2
+      cat "$WORK/validate.log" >&2
+      exit 1
+    fi
+  else
+    echo "config fixture rejected by busbar --validate (not a grammar-vintage difference):" >&2
+    cat "$WORK/validate.log" >&2
+    exit 1
+  fi
+fi
+echo "admin_auth config grammar: $GRAMMAR ($("$BUSBAR_BIN" --version))"
 
 "$BUSBAR_BIN" > "$WORK/busbar.log" 2>&1 &
 BUSBAR_PID=$!

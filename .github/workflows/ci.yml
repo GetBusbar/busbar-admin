@@ -2,11 +2,17 @@ name: CI
 
 on:
   push:
-    branches: [main, dev]
+    branches: [main, dev, qa]
   pull_request:
+    branches: [main, dev, qa]
 
 env:
   CARGO_TERM_COLOR: always
+  # Which busbar core ref this run is PAIRED with. On a push it is this branch (dev → core dev,
+  # qa → core qa, main → core main). On a pull_request `github.ref_name` is the synthetic
+  # `<n>/merge` ref, which does not exist in core — so pair with the PR's TARGET branch instead,
+  # which is the branch this work is about to become.
+  BUSBAR_REF: ${{ github.base_ref || github.ref_name }}
 
 jobs:
   build:
@@ -27,12 +33,58 @@ jobs:
         run: cargo test --locked --verbose
 
   integration:
-    # BIDIRECTIONAL TESTING (matches how the plugin repos test themselves against busbar): download
-    # the latest RELEASED busbar, boot it, and drive EVERY busbar-admin command against it, asserting
-    # real effects. Catches client drift a `cargo build` never would — a renamed field, a changed
-    # status code, a broken auth header. (busbar core's own dev-gate runs the SAME scripts/
-    # integration.sh against the freshly-built engine, the reverse direction.)
+    # ── THE RELEASE GATE (blocking). PAIRED engine, not a released one. ──────────────────────────
+    # Check out GetBusbar/busbar at the SAME BRANCH as this run, build it from source, boot it, and
+    # drive EVERY busbar-admin command against it, asserting real effects. Catches client drift a
+    # `cargo build` never would — a renamed field, a changed status code, a broken auth header.
+    #
+    # Why same-branch and not `gh release download` (which is what this job used to do): the
+    # contract that actually has to hold is "this client works with the engine it will ship
+    # BESIDE". Pinning to the last release makes that contract untestable during a cycle — busbar
+    # 1.5.3 retired the inline `auth.admin_auth:` grammar, the fixture moved with it, and the
+    # released 1.5.2 binary rejected the config outright, so the gate was measuring engine vintage
+    # rather than client correctness. Every plugin repo already pairs same-branch via core's
+    # reusable plugin-ci.yml (`busbar_ref: ${{ github.ref_name }}`); this was the last repo in the
+    # fleet still testing against a fixed release. The `integration-released` job below keeps the
+    # OTHER, genuinely different question ("does today's client work with the gateway users have
+    # TODAY?") answered — non-blocking, because its answer is legitimately allowed to be "no".
+    name: integration (paired busbar @ ${{ github.base_ref || github.ref_name }})
     runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: busbar-admin
+      - name: Checkout busbar (sibling, SAME branch as this run)
+        uses: actions/checkout@v4
+        with:
+          repository: GetBusbar/busbar
+          ref: ${{ env.BUSBAR_REF }}
+          path: busbarAI
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build busbar-admin
+        working-directory: busbar-admin
+        run: cargo build --release --locked
+      - name: Build busbar (from the sibling checkout)
+        working-directory: busbarAI
+        run: |
+          cargo build --release --bin busbar
+          target/release/busbar --version
+      - name: Drive every command against the paired gateway
+        working-directory: busbar-admin
+        run: scripts/integration.sh ../busbarAI/target/release/busbar target/release/busbar-admin
+
+  integration-released:
+    # ── NON-BLOCKING (continue-on-error). Last RELEASED busbar. ──────────────────────────────────
+    # Deliberately NOT a release gate. It answers the question same-branch pairing cannot: "does
+    # the client we are about to ship still work against the gateway an operator has installed
+    # right now?" That is real information — but it is ALLOWED TO BE RED mid-cycle, whenever the
+    # client has legitimately moved ahead of the last release. If this job ever blocks, the whole
+    # fleet inherits a permanently-red gate, which is exactly the failure this split fixes.
+    # Read its result as a compatibility REPORT, never as a reason to stop a release.
+    name: integration vs last RELEASED busbar (informational — never blocks)
+    runs-on: ubuntu-latest
+    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -49,7 +101,7 @@ jobs:
           tar -xzf /tmp/busbar-dl/busbar-x86_64-unknown-linux-gnu.tar.gz -C /tmp/busbar-dl
           chmod +x /tmp/busbar-dl/busbar
           /tmp/busbar-dl/busbar --version
-      - name: Drive every command against the real gateway
+      - name: Drive every command against the released gateway
         run: scripts/integration.sh /tmp/busbar-dl/busbar target/release/busbar-admin
 
   spec-drift:
@@ -57,6 +109,19 @@ jobs:
     # Fail when the latest busbar release ships a NEWER spec version than the one committed,
     # so drift is visible instead of silent. Degrades to a warning if the GitHub API is
     # unavailable or rate-limited (keeps the check non-flaky).
+    #
+    # RELEASED-vs-PAIRED, deliberately kept as-is for the BLOCKING half. Unlike `integration`, the
+    # released comparison here is asking the right question: openapi.json is a COMMITTED ARTEFACT
+    # copied out of core, and "have we refreshed it for the engine that has actually shipped?" is a
+    # real, answerable obligation. It cannot be red for being ahead either — the client only ever
+    # gets ahead by someone copying a newer spec in, which they do together with the release.
+    #
+    # What it CANNOT see is structural drift under an unchanged `info.version` — and that is not
+    # hypothetical: core `dev` and this repo's committed copy are BOTH stamped 1.5.2 while core has
+    # already replaced the hooks-status `settings` bag with `settings_keys`/`drift_keys`. So a
+    # second, PAIRED, NON-BLOCKING step below diffs the whole document against core at this run's
+    # branch. Non-blocking on purpose: mid-cycle the paired spec is SUPPOSED to be ahead of the
+    # committed copy, so a hard failure there would be a permanently-red gate.
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -86,3 +151,25 @@ jobs:
             exit 1
           fi
           echo "spec is current (v$committed)"
+
+      # ── PAIRED, STRUCTURAL, NON-BLOCKING (see the job comment above) ────────────────────────────
+      - name: Checkout busbar (sibling, SAME branch as this run)
+        uses: actions/checkout@v4
+        continue-on-error: true
+        with:
+          repository: GetBusbar/busbar
+          ref: ${{ env.BUSBAR_REF }}
+          path: busbarAI
+      - name: structural diff against the PAIRED core spec (informational — never blocks)
+        continue-on-error: true
+        run: |
+          set -u
+          paired=busbarAI/crates/busbar/src/admin/v1/json/openapi.json
+          [ -f "$paired" ] || { echo "::warning::paired core spec not present at $paired; skipping"; exit 0; }
+          echo "committed: v$(jq -r .info.version openapi.json)   paired core ($BUSBAR_REF): v$(jq -r .info.version "$paired")"
+          if diff -u <(jq -S . "$paired") <(jq -S . openapi.json) > /tmp/spec.diff; then
+            echo "no structural drift against the paired core spec"
+          else
+            echo "::warning::committed openapi.json differs STRUCTURALLY from core@$BUSBAR_REF — expected mid-cycle; refresh + re-audit src/client.rs before the release"
+            head -c 20000 /tmp/spec.diff
+          fi
