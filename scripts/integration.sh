@@ -39,11 +39,12 @@ EOF
 cat > "$BUSBAR_CONFIG" <<EOF
 listen: "127.0.0.1:${PORT}"
 admin_listen: "127.0.0.1:${ADMIN_PORT}"
+identity-providers:
+  admin-tokens: { module: admin-tokens, token: { env: BUSBAR_ADMIN_TOKEN } }
 auth:
   chain: [keys]
   signing_key: { file: "${WORK}/signing.key" }
-  admin_auth:
-    - admin-tokens: { token: { env: BUSBAR_ADMIN_TOKEN } }
+  admin_auth: [admin-tokens]
 providers:
   mock:
     api_key: { env: MOCK_KEY }
