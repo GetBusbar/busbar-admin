@@ -38,14 +38,13 @@ jobs:
     # drive EVERY busbar-admin command against it, asserting real effects. Catches client drift a
     # `cargo build` never would — a renamed field, a changed status code, a broken auth header.
     #
-    # Why same-branch and not `gh release download` (which is what this job used to do): the
-    # contract that actually has to hold is "this client works with the engine it will ship
-    # BESIDE". Pinning to the last release makes that contract untestable during a cycle — busbar
-    # 1.5.3 retired the inline `auth.admin_auth:` grammar, the fixture moved with it, and the
-    # released 1.5.2 binary rejected the config outright, so the gate was measuring engine vintage
-    # rather than client correctness. Every plugin repo already pairs same-branch via core's
-    # reusable plugin-ci.yml (`busbar_ref: ${{ github.ref_name }}`); this was the last repo in the
-    # fleet still testing against a fixed release. The `integration-released` job below keeps the
+    # Why same-branch rather than `gh release download`: the contract that actually has to hold is
+    # "this client works with the engine it will ship BESIDE". Pinning to the last release makes
+    # that contract untestable during a cycle — busbar 1.5.3 retired the inline `auth.admin_auth:`
+    # grammar and the fixture moved with it, so a released 1.5.2 binary rejects the config outright
+    # and the gate measures engine vintage rather than client correctness. Every plugin repo pairs
+    # same-branch via core's reusable plugin-ci.yml (`busbar_ref: ${{ github.ref_name }}`).
+    # The `integration-released` job below keeps the
     # OTHER, genuinely different question ("does today's client work with the gateway users have
     # TODAY?") answered — non-blocking, because its answer is legitimately allowed to be "no".
     name: integration (paired busbar @ ${{ github.base_ref || github.ref_name }})
@@ -129,9 +128,9 @@ jobs:
     # arm) — with the modelled field set derived by serializing the real structs so it cannot drift
     # from the types.
     #
-    # This one CAN block without being permanently red, which the old whole-document diff could
-    # not. The difference is scope: the diff compared EVERYTHING, so core legitimately racing ahead
-    # mid-cycle with new endpoints made it red for a reason nobody should act on. The contract test
+    # This one CAN block without being permanently red, which a whole-document diff cannot. The
+    # difference is scope: a diff compares EVERYTHING, so core legitimately racing ahead mid-cycle
+    # with new endpoints turns it red for a reason nobody should act on. The contract test
     # is scoped to what this client actually CONSUMES, so a new endpoint or a new optional field in
     # core is invisible to it, and only a removal, a rename, or a new required field this client
     # drops on the floor can fail it. Those are exactly the changes a human must act on.

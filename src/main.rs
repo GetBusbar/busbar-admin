@@ -762,10 +762,9 @@ mod cli_logic_tests {
         assert_eq!(m.get("k").map(String::as_str), Some(""));
     }
 
-    // Calls the REAL `resolve_allowed_pools` that `cmd_keys_create` uses — not a copy — so a
-    // regression in the actual fail-open-on-privilege mapping fails this test. (The round-1
-    // version tested a duplicated helper and was tautological: it passed even if the real code
-    // regressed.)
+    // Calls the REAL `resolve_allowed_pools` that `cmd_keys_create` uses, never a copy of it: a
+    // test against a duplicated helper is tautological and stays green even when the shipped
+    // mapping regresses.
     #[test]
     fn allowed_pools_tristate_no_pools_is_empty_not_none() {
         assert_eq!(
