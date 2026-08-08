@@ -1,7 +1,18 @@
 name: Release
 
-# Builds release binaries for macOS + Linux on a v* tag and uploads them to the
-# GitHub release. NOTE: untested without a real tag push — treat as a starting point.
+# Builds release binaries for macOS + Linux on a v* tag and uploads them to the GitHub release.
+#
+# The Release is created as a DRAFT and is promoted to published-and-latest only after the build
+# matrix has finished AND the expected number of assets is provably attached. This is the same
+# shape every first-party plugin repo uses, and it is here for the same reason: this workflow used
+# to have each matrix leg independently create-or-update a PUBLISHED release via
+# softprops/action-gh-release, so a leg that failed after a sibling had already uploaded left a
+# published release carrying fewer assets than it should, with `latest` pointing at it. A user
+# on the missing platform gets a 404 from a release that looks complete. Nothing in the old
+# workflow could detect that: every gate it had was about whether the build compiled.
+#
+# A draft is invisible to users and to `releases/latest`, so the failure mode is now "the release
+# does not appear" rather than "the release appears and is wrong".
 
 on:
   push:
@@ -10,9 +21,38 @@ on:
 permissions:
   contents: write
 
+env:
+  # Every target in the build matrix must land an asset before the release is promoted. Keep this
+  # in step with the matrix below; the gate compares against it rather than against "more than
+  # zero", so a silent drop from three platforms to one fails too.
+  EXPECTED_ASSETS: "3"
+
 jobs:
+  # Created first so the parallel matrix legs have something to attach to (uploading from a matrix
+  # with no pre-existing release races and fails with "release not found"). Draft from the start:
+  # the promotion below is the only thing that ever publishes it.
+  create-release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Create draft Release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --title "${GITHUB_REF_NAME}" \
+            --draft \
+            --verify-tag --generate-notes \
+          || gh release view "${GITHUB_REF_NAME}" --repo "${GITHUB_REPOSITORY}"
+
   build:
+    needs: create-release
     strategy:
+      # Let every leg run and report. With fail-fast the first failure cancels its siblings, which
+      # hides how many platforms are actually broken; the draft gate below is what keeps a partial
+      # result from reaching users, so there is nothing to protect by stopping early.
+      fail-fast: false
       matrix:
         include:
           - target: x86_64-unknown-linux-gnu
@@ -34,6 +74,32 @@ jobs:
           tar -C target/${{ matrix.target }}/release -czf \
             busbar-admin-${{ github.ref_name }}-${{ matrix.target }}.tar.gz busbar-admin
       - name: upload
-        uses: softprops/action-gh-release@v2
-        with:
-          files: busbar-admin-${{ github.ref_name }}-${{ matrix.target }}.tar.gz
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release upload "${GITHUB_REF_NAME}" \
+            "busbar-admin-${GITHUB_REF_NAME}-${{ matrix.target }}.tar.gz" \
+            --repo "${GITHUB_REPOSITORY}" --clobber
+
+  # The only step that ever publishes. `needs: build` means a total build failure never reaches it
+  # at all and the release stays an invisible draft; a partial failure reaches it and is refused
+  # here on the count.
+  verify-assets:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require the full asset set, then promote
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          count="$(gh release view "${GITHUB_REF_NAME}" --repo "${GITHUB_REPOSITORY}" \
+                     --json assets --jq '.assets | length')"
+          echo "attached assets: ${count} (expected ${EXPECTED_ASSETS})"
+          gh release view "${GITHUB_REF_NAME}" --repo "${GITHUB_REPOSITORY}" \
+            --json assets --jq '.assets[].name'
+          if [ "${count}" -ne "${EXPECTED_ASSETS}" ]; then
+            echo "::error::PARTIAL RELEASE PREVENTED: ${GITHUB_REF_NAME} has ${count} assets, expected ${EXPECTED_ASSETS}. Leaving it as a DRAFT so no user can download an incomplete release." >&2
+            exit 1
+          fi
+          gh release edit "${GITHUB_REF_NAME}" --repo "${GITHUB_REPOSITORY}" --draft=false --latest
