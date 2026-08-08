@@ -4,8 +4,14 @@ A human-facing CLI for the [busbar](https://github.com/GetBusbar) gateway's **ad
 (`/api/v1/admin`). It speaks the frozen v1 contract over HTTP/HTTPS with a thin, hand-rolled
 client (no OpenAPI generator), so it's small and easy to extend.
 
-The contract it targets is committed at [`openapi.json`](openapi.json) (busbar **1.5.2**);
+The contract it targets is committed at [`openapi.json`](openapi.json) (busbar **1.5.3**);
 CI compares that spec's version against the latest busbar release so drift is visible.
+
+Because the client is hand-rolled, a version match is not a shape match:
+[`tests/openapi_conformance.rs`](tests/openapi_conformance.rs) loads that same committed
+`openapi.json` and checks every request/response type in `src/client.rs` against its schema, field
+set, required/nullable-ness, and endpoint wiring. Renaming a Rust field, making a required field
+optional, or resyncing a spec that grew a property all fail `cargo test`.
 
 ## Install
 
