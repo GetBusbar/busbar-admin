@@ -57,6 +57,48 @@ jobs:
       - name: Drive every command against the real gateway
         run: scripts/integration.sh /tmp/busbar-dl/busbar target/release/busbar-admin
 
+  spec-mirror:
+    # THE SHAPE OF THE SPEC ITSELF, which nothing else in this repo checks.
+    #
+    # Three questions, three different gates, and it is worth being explicit about which is which:
+    #   1. "Does src/client.rs match the committed openapi.json?"  -> tests/openapi_conformance.rs
+    #      (in the build job). Rust vs its OWN copy of the spec.
+    #   2. "Is the committed spec's VERSION STRING current?"       -> the spec-drift job below.
+    #   3. "Is the committed spec the same DOCUMENT as core's?"    -> this job. Nothing answered it.
+    #
+    # Question 2 is not a substitute for question 3, and assuming it was is what shipped: a mirror
+    # can carry core's exact info.version and still be missing properties, because the version
+    # string is copied along with everything else and says nothing about what was left behind. So
+    # this job never looks at the version. It walks components.schemas property-by-property and
+    # paths method-by-method and names every schema and property that differs.
+    #
+    # And it FAILS CLOSED. The spec-drift job below prints ::warning:: and exits 0 when the GitHub
+    # API is unreachable, which means a rate-limited runner reports "no drift" without having
+    # looked. This job exits non-zero instead. An unknown is not a pass.
+    #
+    # REF: latest-release, not a branch. This client is built and integration-tested against the
+    # latest RELEASED busbar (see the integration job, which downloads exactly that), so the spec
+    # it commits must be the released engine's spec. Tracking a branch here would make the client
+    # document endpoints and fields no released busbar serves.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      # SELF-TEST FIRST, then the verdict. Fleet convention, and the whole reason this job exists:
+      # an assertion nobody has watched fail is indistinguishable from `exit 0`. This proves the
+      # gate goes RED on a missing schema, a missing property, an extra property, a changed
+      # required set, a changed enum, a changed type, and a core spec it could not fetch or parse.
+      - name: spec-mirror gate self-test (red before green)
+        run: python3 scripts/spec_mirror_gate.py --selftest
+
+      - name: committed openapi.json is the same document as busbar core's
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 scripts/spec_mirror_gate.py --mirror openapi.json --busbar-ref latest-release
+
   spec-drift:
     # The admin client is hand-rolled against openapi.json (committed at the repo root).
     # This job answers "is the committed spec CURRENT?" only. Whether src/client.rs still MATCHES
