@@ -332,3 +332,14 @@ def run(out):
               "mirror and names the schema/property at fault, and an unknown core spec is\n"
               "FATAL rather than green. The gate's verdict can be trusted.\n" % passed)
     return 0
+
+
+# Running this file DIRECTLY must not look like a pass. Without this, `python3
+# spec_mirror_selftest.py` defined `run()` and exited 0 having asserted NOTHING, which is the exact
+# shape of failure this whole gate exists to remove: a green that proves nothing ran. The canonical
+# entry point is `spec_mirror_gate.py --selftest`, which is what CI invokes; this makes the direct
+# invocation do the same thing rather than silently succeed.
+if __name__ == "__main__":
+    import sys
+
+    sys.exit(run(sys.stdout))
