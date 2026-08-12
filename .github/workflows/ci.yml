@@ -23,6 +23,11 @@ jobs:
         run: cargo clippy --all-targets -- -D warnings
       - name: build
         run: cargo build --locked --verbose
+      # Includes tests/openapi_conformance.rs, the SHAPE gate: it loads the committed openapi.json
+      # and checks every serde type in src/client.rs against its schema (field set, required vs
+      # nullable, round trip, endpoint wiring). The spec-drift job below only compares a version
+      # STRING, so this is the check that fails when a struct drifts from the spec in the same
+      # commit. Keep `cargo test` in this workflow: it is the only thing running that gate.
       - name: test
         run: cargo test --locked --verbose
 
@@ -54,6 +59,8 @@ jobs:
 
   spec-drift:
     # The admin client is hand-rolled against openapi.json (committed at the repo root).
+    # This job answers "is the committed spec CURRENT?" only. Whether src/client.rs still MATCHES
+    # that spec is a separate question, answered by tests/openapi_conformance.rs in the build job.
     # Fail when the latest busbar release ships a NEWER spec version than the one committed,
     # so drift is visible instead of silent. Degrades to a warning if the GitHub API is
     # unavailable or rate-limited (keeps the check non-flaky).

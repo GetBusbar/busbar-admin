@@ -4,29 +4,15 @@
 //! busbar-admin — a human-facing CLI for the busbar gateway's admin API (`/api/v1/admin`).
 //!
 //! Config resolution is CLI flag > env var > a clear error. The thin admin client lives in
-//! [`client`]; this module is the clap surface + human/JSON rendering.
-
-mod client;
+//! `busbar_admin::client`; this module is the clap surface + human/JSON rendering.
 
 use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand};
 
-use client::{Client, CreateKeyReq, InspectPluginReq, InstallPluginReq, KeyView, PluginView, Tls};
-
-/// Resolve the three distinct `allowed_pools` states the server understands: omitted (`None`) =
-/// ALL pools; an explicit empty list (`--no-pools`) = NO pools; a non-empty list = exactly those.
-/// A shared function so `cmd_keys_create` and its test exercise the SAME mapping — collapsing
-/// `--no-pools` into `None` would mint an all-pools key when no-pools was asked for (fail-open on
-/// privilege).
-fn resolve_allowed_pools(no_pools: bool, pools: &[String]) -> Option<Vec<String>> {
-    if no_pools {
-        Some(Vec::new())
-    } else if pools.is_empty() {
-        None
-    } else {
-        Some(pools.to_vec())
-    }
-}
+use busbar_admin::argmap::{parse_labels, resolve_allowed_pools};
+use busbar_admin::client::{
+    Client, CreateKeyReq, InspectPluginReq, InstallPluginReq, KeyView, PluginView, Tls,
+};
 
 /// busbar-admin — talk to a busbar gateway's admin API.
 #[derive(Parser)]
@@ -336,17 +322,6 @@ fn cmd_keys_list(c: &Client, json: bool) -> Result<()> {
         println!("(more keys available — showing the first page)");
     }
     Ok(())
-}
-
-fn parse_labels(pairs: &[String]) -> Result<std::collections::BTreeMap<String, String>> {
-    pairs
-        .iter()
-        .map(|p| {
-            p.split_once('=')
-                .map(|(k, v)| (k.to_string(), v.to_string()))
-                .ok_or_else(|| anyhow::anyhow!("--label must be KEY=VALUE, got {p:?}"))
-        })
-        .collect()
 }
 
 fn pools_summary(pools: &Option<Vec<String>>) -> String {
@@ -736,52 +711,4 @@ fn human_duration(secs: u64) -> String {
     }
     parts.push(format!("{s}s"));
     parts.join(" ")
-}
-
-#[cfg(test)]
-mod cli_logic_tests {
-    use super::*;
-
-    #[test]
-    fn parse_labels_splits_on_first_equals_only() {
-        // A value containing '=' (a URL query string, a base64 pad) must survive intact — the
-        // split is on the FIRST '=', not all of them.
-        let m = parse_labels(&["url=http://x?a=b".into(), "team=platform".into()]).unwrap();
-        assert_eq!(m.get("url").map(String::as_str), Some("http://x?a=b"));
-        assert_eq!(m.get("team").map(String::as_str), Some("platform"));
-    }
-
-    #[test]
-    fn parse_labels_rejects_a_pair_with_no_equals() {
-        assert!(parse_labels(&["novalue".into()]).is_err());
-    }
-
-    #[test]
-    fn parse_labels_allows_empty_value() {
-        let m = parse_labels(&["k=".into()]).unwrap();
-        assert_eq!(m.get("k").map(String::as_str), Some(""));
-    }
-
-    // Calls the REAL `resolve_allowed_pools` that `cmd_keys_create` uses — not a copy — so a
-    // regression in the actual fail-open-on-privilege mapping fails this test. (The round-1
-    // version tested a duplicated helper and was tautological: it passed even if the real code
-    // regressed.)
-    #[test]
-    fn allowed_pools_tristate_no_pools_is_empty_not_none() {
-        assert_eq!(
-            resolve_allowed_pools(true, &[]),
-            Some(Vec::new()),
-            "--no-pools => NO pools"
-        );
-        assert_eq!(
-            resolve_allowed_pools(false, &[]),
-            None,
-            "omitted => ALL pools"
-        );
-        assert_eq!(
-            resolve_allowed_pools(false, &["p1".into()]),
-            Some(vec!["p1".into()]),
-            "a list => exactly those pools"
-        );
-    }
 }
