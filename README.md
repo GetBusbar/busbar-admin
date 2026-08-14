@@ -4,7 +4,7 @@ A human-facing CLI for the [busbar](https://github.com/GetBusbar) gateway's **ad
 (`/api/v1/admin`). It speaks the frozen v1 contract over HTTP/HTTPS with a thin, hand-rolled
 client (no OpenAPI generator), so it's small and easy to extend.
 
-The contract it targets is committed at [`openapi.json`](openapi.json) (busbar **1.5.3**);
+The contract it targets is committed at [`openapi.json`](openapi.json) (busbar **1.5.4**);
 CI compares that spec's version against the latest busbar release so drift is visible.
 
 Because the client is hand-rolled, a version match is not a shape match:
