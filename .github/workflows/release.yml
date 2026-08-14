@@ -21,12 +21,6 @@ on:
 permissions:
   contents: write
 
-env:
-  # Every target in the build matrix must land an asset before the release is promoted. Keep this
-  # in step with the matrix below; the gate compares against it rather than against "more than
-  # zero", so a silent drop from three platforms to one fails too.
-  EXPECTED_ASSETS: "3"
-
 jobs:
   # Created first so the parallel matrix legs have something to attach to (uploading from a matrix
   # with no pre-existing release races and fails with "release not found"). Draft from the start:
@@ -46,21 +40,61 @@ jobs:
             --verify-tag --generate-notes \
           || gh release view "${GITHUB_REF_NAME}" --repo "${GITHUB_REPOSITORY}"
 
+  # THE PLATFORM LIST, IN EXACTLY ONE PLACE. This job reads .github/release-targets.json and emits
+  # BOTH the build matrix `build` runs AND the exact set of asset filenames that matrix is
+  # contractually obliged to produce. `build` consumes the first; `verify-assets` consumes the
+  # second -- so "the set that was supposed to be built" and "the set that gets verified" are
+  # literally the same computation and cannot drift apart.
+  #
+  # IT REPLACES THE `EXPECTED_ASSETS: "3"` COUNT THIS FILE USED TO CARRY. That count was already
+  # stricter than the rest of the fleet's `assets != 0`, and it was still blind in the way that
+  # matters: it could say THREE ARE MISSING but never WHICH PLATFORM, and it passes for three
+  # assets of which one is misnamed. It was also a second literal to keep in step with the matrix
+  # by hand -- the same defect one level up.
+  targets:
+    name: release target matrix (single source of truth)
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.emit.outputs.matrix }}
+      assets: ${{ steps.emit.outputs.assets }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Emit the target matrix and the asset names it must produce
+        id: emit
+        run: |
+          set -euo pipefail
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import json, os
+          spec = json.load(open(".github/release-targets.json"))
+          # THE RAW TAG, `v` AND ALL: the package step below names the archive
+          # busbar-admin-${GITHUB_REF_NAME}-<target>.tar.gz, so the expectation is derived the same
+          # way the artifact is built.
+          tag = os.environ["GITHUB_REF_NAME"]
+          inc = [{k: t[k] for k in ("target", "os")} for t in spec["targets"]]
+          assets = ["%s-%s-%s.tar.gz" % (spec["asset_prefix"], tag, t["target"])
+                    for t in spec["targets"]]
+          # A FLOOR, BECAUSE A LOOP OVER A DISCOVERED SET WITH NO FLOOR PASSES WHEN THE SET IS EMPTY.
+          # Both the build matrix and the expectation list are enumerated from this output, so a
+          # truncated or mis-parsed manifest would otherwise build nothing, expect nothing, and
+          # report green all the way to a promoted release with no assets on it.
+          if len(inc) < 3:
+              raise SystemExit(
+                  "release-targets.json declares %d targets; busbar-admin ships 3. Refusing to run "
+                  "a build matrix and an expectation list over a set this small: an empty "
+                  "expectation list passes for a release that published nothing." % len(inc))
+          print("matrix=" + json.dumps({"include": inc}))
+          print("assets=" + json.dumps(assets))
+          PY
+          cat "$GITHUB_OUTPUT"
+
   build:
-    needs: create-release
+    needs: [create-release, targets]
     strategy:
       # Let every leg run and report. With fail-fast the first failure cancels its siblings, which
       # hides how many platforms are actually broken; the draft gate below is what keeps a partial
       # result from reaching users, so there is nothing to protect by stopping early.
       fail-fast: false
-      matrix:
-        include:
-          - target: x86_64-unknown-linux-gnu
-            os: ubuntu-latest
-          - target: aarch64-apple-darwin
-            os: macos-latest
-          - target: x86_64-apple-darwin
-            os: macos-latest
+      matrix: ${{ fromJSON(needs.targets.outputs.matrix) }}
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -81,25 +115,93 @@ jobs:
             "busbar-admin-${GITHUB_REF_NAME}-${{ matrix.target }}.tar.gz" \
             --repo "${GITHUB_REPOSITORY}" --clobber
 
-  # The only step that ever publishes. `needs: build` means a total build failure never reaches it
-  # at all and the release stays an invisible draft; a partial failure reaches it and is refused
-  # here on the count.
+  # THE ONLY STEP THAT EVER PUBLISHES, and it now asserts the draft carries every asset BY NAME.
+  # A total build failure never reaches it at all and the release stays an invisible draft; a
+  # PARTIAL failure reaches it and is refused here, naming the platforms that are missing.
+  #
+  # `!cancelled()` IS LOAD-BEARING. `build` runs fail-fast:false, so a partial matrix FAILS the job,
+  # and a `needs:` on a failed job SKIPS its dependent by default -- the one guard that exists to
+  # notice a broken release would be switched off precisely when the release is broken. Running on
+  # `!cancelled()` turns a partial matrix into a RED verify-assets that NAMES the missing platforms,
+  # instead of a grey one that names nothing.
   verify-assets:
-    needs: build
+    name: the draft owes every asset the manifest names
+    needs: [targets, build]
+    if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
     steps:
-      - name: Require the full asset set, then promote
+      - name: Assert the draft carries every asset, then promote it
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          EXPECTED: ${{ needs.targets.outputs.assets }}
         run: |
           set -euo pipefail
-          count="$(gh release view "${GITHUB_REF_NAME}" --repo "${GITHUB_REPOSITORY}" \
-                     --json assets --jq '.assets | length')"
-          echo "attached assets: ${count} (expected ${EXPECTED_ASSETS})"
-          gh release view "${GITHUB_REF_NAME}" --repo "${GITHUB_REPOSITORY}" \
-            --json assets --jq '.assets[].name'
-          if [ "${count}" -ne "${EXPECTED_ASSETS}" ]; then
-            echo "::error::PARTIAL RELEASE PREVENTED: ${GITHUB_REF_NAME} has ${count} assets, expected ${EXPECTED_ASSETS}. Leaving it as a DRAFT so no user can download an incomplete release." >&2
+          # `!cancelled()` means this runs even when `targets` itself failed, and an empty
+          # expectation list would then "verify" every release vacuously. Refuse instead.
+          if [ -z "${EXPECTED:-}" ]; then
+            echo "::error::The targets job produced no expected-asset list, so there is nothing to" \
+                 "verify ${GITHUB_REF_NAME} against. Refusing to promote: it stays a draft." >&2
             exit 1
           fi
+          gh release view "${GITHUB_REF_NAME}" --repo "${GITHUB_REPOSITORY}" \
+            --json assets --jq '.assets[] | "\(.name)\t\(.size)"' > /tmp/got.tsv || : > /tmp/got.tsv
+          echo "Draft ${GITHUB_REF_NAME} carries these assets:"
+          cat /tmp/got.tsv
+          python3 - <<'PY'
+          import json, os, sys
+          expected = json.loads(os.environ["EXPECTED"])
+          tag = os.environ["GITHUB_REF_NAME"]
+          got = {}
+          for line in open("/tmp/got.tsv"):
+              line = line.rstrip("\n")
+              if not line:
+                  continue
+              name, _, size = line.partition("\t")
+              got[name] = int(size or 0)
+
+          missing = [a for a in expected if a not in got]
+          # A NAME IN THE ASSET LIST IS NOT A USABLE ARTIFACT: GitHub creates the row as soon as the
+          # upload starts, so a 0-byte or truncated upload lists identically to a good one. 1 KiB is
+          # far below any real busbar-admin archive and far above an empty or header-only file.
+          empty = [a for a in expected if a in got and got[a] < 1024]
+
+          lines = ["### Draft asset verification", "",
+                   "| asset | bytes | verdict |", "| --- | --- | --- |"]
+          for a in expected:
+              if a not in got:
+                  lines.append("| `%s` | - | MISSING |" % a)
+              elif got[a] < 1024:
+                  lines.append("| `%s` | %d | TOO SMALL |" % (a, got[a]))
+              else:
+                  lines.append("| `%s` | %d | ok |" % (a, got[a]))
+          extra = sorted(set(got) - set(expected))
+          if extra:
+              lines += ["", "Also present (not required): " + ", ".join("`%s`" % e for e in extra)]
+          summary = os.environ.get("GITHUB_STEP_SUMMARY")
+          if summary:
+              open(summary, "a").write("\n".join(lines) + "\n")
+          print("\n".join(lines))
+
+          if not got:
+              print("::error::PHANTOM RELEASE: the %s draft has 0 assets. Every build target failed "
+                    "to upload. Nothing is public and nothing was promoted, so this is a clean "
+                    "retry: fix the build and re-run this workflow." % tag, file=sys.stderr)
+              sys.exit(1)
+          if missing:
+              print("::error::PARTIAL RELEASE PREVENTED: the %s draft is missing %d of %d required "
+                    "asset(s): %s. Each missing name is a PLATFORM whose users would get a 404 from "
+                    "the download link. It stays a DRAFT, so nothing user-facing exists: fix that "
+                    "target's leg and re-run." %
+                    (tag, len(missing), len(expected), ", ".join(missing)), file=sys.stderr)
+          if empty:
+              print("::error::TRUNCATED RELEASE: these %s draft assets are under 1 KiB, which means "
+                    "the upload was cut short and the archive is useless to anyone who downloads "
+                    "it: %s" % (tag, ", ".join(empty)), file=sys.stderr)
+          if missing or empty:
+              sys.exit(1)
+          print("All %d required assets present and plausibly sized." % len(expected))
+          PY
+          # Only now, with EVERY promised asset provably attached and plausibly sized, does this
+          # stop being a draft and become the release that `releases/latest` resolves to.
           gh release edit "${GITHUB_REF_NAME}" --repo "${GITHUB_REPOSITORY}" --draft=false --latest
+          echo "::notice::Published ${GITHUB_REF_NAME} with every asset in the contract."
