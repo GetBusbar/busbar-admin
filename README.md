@@ -1,5 +1,7 @@
 # busbar-admin
 
+[![Coverage](https://codecov.io/gh/GetBusbar/busbar-admin/branch/dev/graph/badge.svg)](https://codecov.io/gh/GetBusbar/busbar-admin)
+
 A human-facing CLI for the [busbar](https://github.com/GetBusbar) gateway's **admin API**
 (`/api/v1/admin`). It speaks the frozen v1 contract over HTTP/HTTPS with a thin, hand-rolled
 client (no OpenAPI generator), so it's small and easy to extend.

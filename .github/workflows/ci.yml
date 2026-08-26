@@ -208,3 +208,39 @@ jobs:
             echo "::warning::committed openapi.json differs STRUCTURALLY from core@$BUSBAR_REF — expected mid-cycle; refresh + re-audit src/client.rs before the release"
             head -c 20000 /tmp/spec.diff
           fi
+
+  # COVERAGE — instrumented run of the same workspace suite the `build` job's `cargo test` runs,
+  # uploaded to Codecov for the README badge and per-PR line-coverage context. Deliberately ADDITIVE
+  # and NON-GATING:
+  #
+  #   * It is a SEPARATE job (not a required check and not wired into any other job's `needs`), so it
+  #     can never turn `dev`/`qa`/`main` red. Coverage reporting is an OBSERVATION, not a correctness
+  #     gate — the gate stays `build`/`integration`/`spec-drift`, which this must never mask or block.
+  #   * It is a SEPARATE job, not a step folded into `build`, on purpose: `cargo llvm-cov` compiles
+  #     with `-C instrument-coverage` and drops `*.profraw` files; isolating it keeps `build` clean.
+  #   * The upload uses `fail_ci_if_error: false` so a Codecov outage or a tokenless-rate-limit is a
+  #     no-op here, not a red job — a reporting dependency must never be able to fail the build.
+  #
+  # busbar-admin's tests need no service containers or test env, so — unlike core's coverage job —
+  # this one mirrors nothing extra; it just runs the same workspace suite under instrumentation.
+  coverage:
+    name: coverage (llvm-cov · codecov)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@cargo-llvm-cov
+      - name: Collect coverage (workspace)
+        run: cargo llvm-cov --workspace --locked --lcov --output-path lcov.info
+      - name: Upload to Codecov (tokenless; never fails the build)
+        uses: codecov/codecov-action@v5
+        with:
+          files: lcov.info
+          slug: GetBusbar/busbar-admin
+          fail_ci_if_error: false
