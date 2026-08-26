@@ -1,5 +1,9 @@
 # busbar-admin
 
+[![CI](https://github.com/GetBusbar/busbar-admin/actions/workflows/ci.yml/badge.svg)](https://github.com/GetBusbar/busbar-admin/actions/workflows/ci.yml)
+[![codecov](https://codecov.io/gh/GetBusbar/busbar-admin/branch/main/graph/badge.svg)](https://codecov.io/gh/GetBusbar/busbar-admin)
+[![License: Apache 2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
+
 A human-facing CLI for the [busbar](https://github.com/GetBusbar) gateway's **admin API**
 (`/api/v1/admin`). It speaks the frozen v1 contract over HTTP/HTTPS with a thin, hand-rolled
 client (no OpenAPI generator), so it's small and easy to extend.
