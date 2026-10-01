@@ -239,7 +239,7 @@ jobs:
       - name: Collect coverage (workspace)
         run: cargo llvm-cov --workspace --locked --ignore-run-fail --lcov --output-path lcov.info
       - name: Upload to Codecov (tokenless; never fails the build)
-        uses: codecov/codecov-action@v5
+        uses: codecov/codecov-action@v7
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
           files: lcov.info
