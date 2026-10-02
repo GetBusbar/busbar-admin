@@ -18,7 +18,7 @@ jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
@@ -50,11 +50,11 @@ jobs:
     name: integration (paired busbar @ ${{ github.base_ref || github.ref_name }})
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           path: busbar-admin
       - name: Checkout busbar (sibling, SAME branch as this run)
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           repository: GetBusbar/busbar
           ref: ${{ env.BUSBAR_REF }}
@@ -85,7 +85,7 @@ jobs:
     runs-on: ubuntu-latest
     continue-on-error: true
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Build busbar-admin
@@ -139,7 +139,7 @@ jobs:
     # the blocking step tells you something moved.
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: compare committed spec version to the latest busbar release
@@ -172,7 +172,7 @@ jobs:
       # ── PAIRED + STRUCTURAL (see the job comment above) ─────────────────────────────────────────
       - name: Checkout busbar (sibling, SAME branch as this run)
         id: pair
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         continue-on-error: true
         with:
           repository: GetBusbar/busbar
@@ -227,7 +227,7 @@ jobs:
     name: coverage (llvm-cov · codecov)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
