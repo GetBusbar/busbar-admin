@@ -18,8 +18,7 @@ on:
   push:
     tags: ["v*", "!v*-*"] # never publish on a -rc prerelease (qa staging marker)
 
-permissions:
-  contents: write
+permissions: {}
 
 env:
   # Every target in the build matrix must land an asset before the release is promoted. Keep this
@@ -32,9 +31,11 @@ jobs:
   # with no pre-existing release races and fails with "release not found"). Draft from the start:
   # the promotion below is the only thing that ever publishes it.
   create-release:
+    permissions:
+      contents: write
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Create draft Release
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -47,6 +48,8 @@ jobs:
           || gh release view "${GITHUB_REF_NAME}" --repo "${GITHUB_REPOSITORY}"
 
   build:
+    permissions:
+      contents: write
     needs: create-release
     strategy:
       # Let every leg run and report. With fail-fast the first failure cancels its siblings, which
@@ -63,8 +66,8 @@ jobs:
             os: macos-latest
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
           targets: ${{ matrix.target }}
       - name: build
@@ -85,6 +88,8 @@ jobs:
   # at all and the release stays an invisible draft; a partial failure reaches it and is refused
   # here on the count.
   verify-assets:
+    permissions:
+      contents: write
     needs: build
     runs-on: ubuntu-latest
     steps:

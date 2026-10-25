@@ -26,8 +26,7 @@ on:
         required: false
         type: string
 
-permissions:
-  contents: write
+permissions: {}
 
 concurrency:
   group: release-on-upstream-${{ github.repository }}
@@ -35,9 +34,11 @@ concurrency:
 
 jobs:
   cut:
+    permissions:
+      contents: write
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: main
           fetch-depth: 0
@@ -49,7 +50,7 @@ jobs:
           git config user.name "busbar-bot"
           git config user.email "bot@getbusbar.com"
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
 
       - name: Resolve target core release
         id: resolve
