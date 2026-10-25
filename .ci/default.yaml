@@ -62,8 +62,13 @@ checks:
       set -euo pipefail
       cargo build --release --locked
       mkdir -p /tmp/busbar-dl
-      curl -fsSL -o /tmp/busbar-dl/busbar-x86_64-unknown-linux-gnu.tar.gz https://github.com/GetBusbar/busbar/releases/latest/download/busbar-x86_64-unknown-linux-gnu.tar.gz
-      tar -xzf /tmp/busbar-dl/busbar-x86_64-unknown-linux-gnu.tar.gz -C /tmp/busbar-dl
+      # The released binary for this machine's own architecture (Actions ran x86_64; ModernCI runs
+      # aarch64). A release without this arch's asset fails here, never falls back.
+      arch=$(uname -m)
+      asset="busbar-${arch}-unknown-linux-gnu.tar.gz"
+      curl -fsSL -o "/tmp/busbar-dl/$asset" "https://github.com/GetBusbar/busbar/releases/latest/download/$asset" \
+        || { echo "the latest busbar release has no $asset: refusing to fall back to another architecture" >&2; exit 1; }
+      tar -xzf "/tmp/busbar-dl/$asset" -C /tmp/busbar-dl
       chmod +x /tmp/busbar-dl/busbar
       /tmp/busbar-dl/busbar --version
       scripts/integration.sh /tmp/busbar-dl/busbar target/release/busbar-admin
