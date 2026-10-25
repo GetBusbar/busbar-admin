@@ -64,6 +64,9 @@ auth:
   chain: [keys]
   signing_key: { file: "${WORK}/signing.key" }
   admin_auth: [admin-tokens]
+# 1.5.5: the durability store is declared; memory is the compiled-in, ephemeral store.
+store:
+  module: memory
 providers:
   mock:
     api_key: { env: MOCK_KEY }
