@@ -1,0 +1,120 @@
+# Imported from .github/workflows/ci.yml by `modernci import github`.
+to: dev
+on:
+  move:
+  - build
+  - coverage
+  - integration
+  - integration-released
+  - spec-drift
+  push:
+  - build
+  - coverage
+  - integration
+  - integration-released
+  - spec-drift
+  landed:
+  - build
+  - coverage
+  - integration
+  - integration-released
+  - spec-drift
+checks:
+  build:
+    run: |
+      set -e
+      # fmt
+      cargo fmt --all --check </dev/null
+      # clippy
+      cargo clippy --all-targets -- -D warnings </dev/null
+      # build
+      cargo build --locked --verbose </dev/null
+      # test
+      cargo test --locked --verbose </dev/null
+    requires:
+    - cargo
+    - cargo-fmt
+    - cargo-clippy
+  coverage:
+    run: |
+      set -e
+      rustup component add llvm-tools-preview </dev/null
+      command -v cargo-llvm-cov >/dev/null 2>&1 || cargo install cargo-llvm-cov --locked </dev/null
+      # Collect coverage (workspace)
+      cargo llvm-cov --workspace --locked --ignore-run-fail --lcov --output-path lcov.info </dev/null
+    requires:
+    - cargo
+  integration:
+    # THE RELEASE GATE: busbar-admin against the PAIRED busbar core (same branch as the target), built from source.
+    run: |
+      set -e
+      cargo build --release --locked
+      B=$(mktemp -d)/busbarAI
+      git clone --depth 1 --branch "$BUSBAR_REF" https://github.com/GetBusbar/busbar.git "$B"
+      (cd "$B" && cargo build --release --bin busbar && target/release/busbar --version)
+      scripts/integration.sh "$B/target/release/busbar" target/release/busbar-admin
+    requires:
+    - cargo
+  integration-released:
+    # Informational (continue-on-error on Actions): may be red against the last release mid-cycle.
+    baseline: target
+    run: |
+      set -euo pipefail
+      cargo build --release --locked
+      mkdir -p /tmp/busbar-dl
+      curl -fsSL -o /tmp/busbar-dl/busbar-x86_64-unknown-linux-gnu.tar.gz https://github.com/GetBusbar/busbar/releases/latest/download/busbar-x86_64-unknown-linux-gnu.tar.gz
+      tar -xzf /tmp/busbar-dl/busbar-x86_64-unknown-linux-gnu.tar.gz -C /tmp/busbar-dl
+      chmod +x /tmp/busbar-dl/busbar
+      /tmp/busbar-dl/busbar --version
+      scripts/integration.sh /tmp/busbar-dl/busbar target/release/busbar-admin
+    requires:
+    - cargo
+  spec-drift:
+    run: |
+      set -u
+      committed=$(jq -r .info.version openapi.json)
+      echo "committed spec version: $committed"
+      tok="${GITHUB_TOKEN:-${GH_TOKEN:-}}"
+      resp=$(curl -sS --max-time 30 ${tok:+-H "Authorization: Bearer $tok"} \
+        -H "Accept: application/vnd.github+json" \
+        https://api.github.com/repos/GetBusbar/busbar/releases/latest) || {
+          echo "::warning::could not reach the GitHub API to check the latest busbar release; skipping spec-drift check"
+          exit 0
+        }
+      latest=$(echo "$resp" | jq -r '.tag_name // empty' | sed 's/^v//')
+      if [ -z "$latest" ]; then
+        echo "::warning::GitHub API returned no usable release tag (rate-limited?); skipping spec-drift check"
+        echo "$resp" | head -c 500
+        exit 0
+      fi
+      echo "latest busbar release: $latest"
+      if [ "$committed" != "$latest" ]; then
+        echo "::error::committed openapi.json is v$committed but the latest busbar release is v$latest - refresh the spec and re-audit src/client.rs"
+        exit 1
+      fi
+      echo "spec is current (v$committed)"
+      # PAIRED + STRUCTURAL: core's spec at this run's branch.
+      B=$(mktemp -d)/busbarAI
+      if git clone --depth 1 --branch "$BUSBAR_REF" https://github.com/GetBusbar/busbar.git "$B"; then
+        BUSBAR_SPEC="$B/crates/busbar/src/admin/v1/json/openapi.json"
+        [ -f "$BUSBAR_SPEC" ] || { echo "::error::paired core spec not present at $BUSBAR_SPEC"; exit 1; }
+        export BUSBAR_SPEC
+        echo "committed: v$(jq -r .info.version openapi.json)   paired core ($BUSBAR_REF): v$(jq -r .info.version "$BUSBAR_SPEC")"
+        cargo test --locked spec_contract -- --nocapture || exit 1
+        # informational diff (never blocks)
+        if diff -u <(jq -S . "$BUSBAR_SPEC") <(jq -S . openapi.json) > /tmp/spec.diff; then
+          echo "no structural drift against the paired core spec"
+        else
+          echo "::warning::committed openapi.json differs STRUCTURALLY from core@$BUSBAR_REF"
+          head -c 20000 /tmp/spec.diff
+        fi
+      else
+        echo "::warning::could not check out busbar@$BUSBAR_REF; skipping the paired contract check"
+      fi
+    requires:
+    - cargo
+env:
+  CARGO_TERM_COLOR: always
+  CI: 'true'
+  # The busbar core ref this run is paired with: the target branch (was github.base_ref || ref_name).
+  BUSBAR_REF: dev
