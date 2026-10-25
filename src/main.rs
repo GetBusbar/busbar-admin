@@ -8,10 +8,17 @@
 
 mod client;
 
-use anyhow::{Context, Result};
-use clap::{Args, Parser, Subcommand};
+use std::io::Write;
+use std::path::Path;
 
-use client::{Client, CreateKeyReq, InspectPluginReq, InstallPluginReq, KeyView, PluginView, Tls};
+use anyhow::{Context, Result};
+use clap::parser::ValueSource;
+use clap::{Args, CommandFactory, FromArgMatches, Parser, Subcommand};
+
+use client::{
+    Client, CreateKeyReq, CreatedKeyView, InspectPluginReq, InstallPluginReq, KeyView, PluginView,
+    RotatedKeyView, Tls,
+};
 
 /// Resolve the three distinct `allowed_pools` states the server understands: omitted (`None`) =
 /// ALL pools; an explicit empty list (`--no-pools`) = NO pools; a non-empty list = exactly those.
@@ -53,6 +60,17 @@ struct GlobalOpts {
         hide_env_values = true
     )]
     token: Option<String>,
+
+    /// Read the admin token from this file (trailing newline ignored). Keeps the token out of
+    /// argv (`ps`, shell history); takes precedence over $BUSBAR_ADMIN_TOKEN.
+    #[arg(long, global = true, value_name = "PATH")]
+    token_file: Option<std::path::PathBuf>,
+
+    /// Write a minted or rotated credential (keys create / keys rotate) to this file (mode 0600)
+    /// instead of stdout, as the full JSON view. `/dev/fd/N` writes to an inherited descriptor.
+    /// Stdout then shows where the credential went in place of its value.
+    #[arg(long, global = true, value_name = "PATH")]
+    output_secret_to: Option<std::path::PathBuf>,
 
     /// Skip TLS certificate verification (DEV ONLY).
     #[arg(long, global = true)]
@@ -212,17 +230,52 @@ fn main() {
     }
 }
 
+/// Warning printed (to stderr) when the admin token arrives on the command line.
+const ARGV_TOKEN_WARNING: &str = "warning: --token puts the admin token in the process list and \
+shell history; prefer --token-file or BUSBAR_ADMIN_TOKEN";
+
+/// Resolve the admin token: `--token-file` > `--token` / $BUSBAR_ADMIN_TOKEN. Returns the token
+/// and whether it came from argv (the caller warns). The token-file's contents never appear in an
+/// error.
+fn resolve_token(
+    token: Option<&str>,
+    source: Option<ValueSource>,
+    token_file: Option<&Path>,
+) -> Result<(String, bool)> {
+    let from_argv = source == Some(ValueSource::CommandLine);
+    if let Some(path) = token_file {
+        if from_argv {
+            anyhow::bail!("--token and --token-file are mutually exclusive");
+        }
+        let raw = std::fs::read_to_string(path)
+            .with_context(|| format!("reading --token-file {}", path.display()))?;
+        let tok = raw.trim_end_matches(['\r', '\n']);
+        if tok.is_empty() {
+            anyhow::bail!("--token-file {} is empty", path.display());
+        }
+        return Ok((tok.to_string(), false));
+    }
+    let tok = token.context("no admin token: pass --token or set BUSBAR_ADMIN_TOKEN")?;
+    Ok((tok.to_string(), from_argv))
+}
+
 fn run() -> Result<()> {
-    let cli = Cli::parse();
+    let matches = Cli::command().get_matches();
+    let cli = Cli::from_arg_matches(&matches).unwrap_or_else(|e| e.exit());
     let g = &cli.global;
 
     let endpoint = g.endpoint.clone().context(
         "no endpoint: pass --endpoint or set BUSBAR_ENDPOINT (e.g. http://localhost:8081)",
     )?;
-    let token = g
-        .token
-        .clone()
-        .context("no admin token: pass --token or set BUSBAR_ADMIN_TOKEN")?;
+    let (token, from_argv) = resolve_token(
+        g.token.as_deref(),
+        matches.value_source("token"),
+        g.token_file.as_deref(),
+    )?;
+    if from_argv {
+        eprintln!("{ARGV_TOKEN_WARNING}");
+    }
+    let secret_to = g.output_secret_to.as_deref();
 
     let tls = Tls {
         insecure: g.insecure,
@@ -237,9 +290,9 @@ fn run() -> Result<()> {
         Command::Info => cmd_info(&c, json),
         Command::Keys(k) => match k {
             KeysCmd::List => cmd_keys_list(&c, json),
-            KeysCmd::Create(a) => cmd_keys_create(&c, a, json),
+            KeysCmd::Create(a) => cmd_keys_create(&c, a, json, secret_to),
             KeysCmd::Get { id } => cmd_keys_get(&c, id, json),
-            KeysCmd::Rotate { id } => cmd_keys_rotate(&c, id, json),
+            KeysCmd::Rotate { id } => cmd_keys_rotate(&c, id, json, secret_to),
             KeysCmd::Revoke { id } => cmd_keys_revoke(&c, id, json),
             KeysCmd::Delete { id } => cmd_keys_delete(&c, id, json),
         },
@@ -357,7 +410,12 @@ fn pools_summary(pools: &Option<Vec<String>>) -> String {
     }
 }
 
-fn cmd_keys_create(c: &Client, a: &KeyCreateArgs, json: bool) -> Result<()> {
+fn cmd_keys_create(
+    c: &Client,
+    a: &KeyCreateArgs,
+    json: bool,
+    secret_to: Option<&Path>,
+) -> Result<()> {
     let req = CreateKeyReq {
         name: a.name.clone(),
         // Three distinct states the server understands: omitted (None) = ALL pools;
@@ -373,31 +431,97 @@ fn cmd_keys_create(c: &Client, a: &KeyCreateArgs, json: bool) -> Result<()> {
         issue_aws_credential: a.issue_aws_credential,
     };
     let created = c.create_key(&req)?;
-    if json {
-        return print_json(&created);
+    render_created(&created, json, secret_to, &mut std::io::stdout().lock())
+}
+
+/// The JSON object names that carry a once-shown credential in a mint or rotate view.
+const SECRET_FIELDS: [&str; 3] = ["token", "aws_secret_access_key", "secret"];
+
+/// Write the full view to the secret sink (created mode 0600 on unix; truncated if it exists).
+fn write_secret_sink<T: serde::Serialize>(path: &Path, view: &T) -> Result<()> {
+    let mut o = std::fs::OpenOptions::new();
+    o.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        o.mode(0o600);
     }
-    println!("created key {} ({})", created.id, created.name);
+    let mut f = o
+        .open(path)
+        .with_context(|| format!("opening --output-secret-to {}", path.display()))?;
+    writeln!(f, "{}", serde_json::to_string_pretty(view)?)
+        .with_context(|| format!("writing --output-secret-to {}", path.display()))?;
+    Ok(())
+}
+
+/// The `--json` rendering with the credential fields dropped (they went to the secret sink).
+fn json_without_secrets<T: serde::Serialize>(view: &T) -> Result<serde_json::Value> {
+    let mut v = serde_json::to_value(view)?;
+    if let Some(o) = v.as_object_mut() {
+        for k in SECRET_FIELDS {
+            o.remove(k);
+        }
+    }
+    Ok(v)
+}
+
+fn render_created(
+    created: &CreatedKeyView,
+    json: bool,
+    secret_to: Option<&Path>,
+    out: &mut dyn Write,
+) -> Result<()> {
+    if let Some(p) = secret_to {
+        write_secret_sink(p, created)?;
+    }
+    if json {
+        let text = match secret_to {
+            None => serde_json::to_string_pretty(created)?,
+            Some(_) => serde_json::to_string_pretty(&json_without_secrets(created)?)?,
+        };
+        writeln!(out, "{text}")?;
+        return Ok(());
+    }
+    let shown = |v: &str| match secret_to {
+        None => v.to_string(),
+        Some(p) => format!("(written to {})", p.display()),
+    };
+    writeln!(out, "created key {} ({})", created.id, created.name)?;
     if let Some(g) = &created.group {
-        println!(
+        writeln!(
+            out,
             "  group: {g}{}",
             if created.group_provisioned {
                 "  (auto-provisioned)"
             } else {
                 ""
             }
-        );
+        )?;
     }
-    println!("  expires_at: {} (unix seconds)", created.expires_at);
-    println!();
-    println!("  ┌─────────────────────────────────────────────────────────────┐");
-    println!("  │  TOKEN (shown once — store it now, it cannot be retrieved)  │");
-    println!("  └─────────────────────────────────────────────────────────────┘");
-    println!("  token: {}", created.token);
+    writeln!(out, "  expires_at: {} (unix seconds)", created.expires_at)?;
+    writeln!(out)?;
+    writeln!(
+        out,
+        "  ┌─────────────────────────────────────────────────────────────┐"
+    )?;
+    writeln!(
+        out,
+        "  │  TOKEN (shown once — store it now, it cannot be retrieved)  │"
+    )?;
+    writeln!(
+        out,
+        "  └─────────────────────────────────────────────────────────────┘"
+    )?;
+    writeln!(out, "  token: {}", shown(created.token.expose()))?;
     if let Some(id) = &created.aws_access_key_id {
-        println!("  aws_access_key_id:     {id}");
+        writeln!(out, "  aws_access_key_id:     {id}")?;
     }
     if let Some(sk) = &created.aws_secret_access_key {
-        println!("  aws_secret_access_key: {sk}  (shown once)");
+        writeln!(
+            out,
+            "  aws_secret_access_key: {}  (shown once)",
+            shown(sk.expose())
+        )?;
     }
     Ok(())
 }
@@ -430,24 +554,54 @@ fn cmd_keys_get(c: &Client, id: &str, json: bool) -> Result<()> {
     Ok(())
 }
 
-fn cmd_keys_rotate(c: &Client, id: &str, json: bool) -> Result<()> {
+fn cmd_keys_rotate(c: &Client, id: &str, json: bool, secret_to: Option<&Path>) -> Result<()> {
     let rotated = c.rotate_key(id)?;
-    if json {
-        return print_json(&rotated);
+    render_rotated(&rotated, json, secret_to, &mut std::io::stdout().lock())
+}
+
+fn render_rotated(
+    rotated: &RotatedKeyView,
+    json: bool,
+    secret_to: Option<&Path>,
+    out: &mut dyn Write,
+) -> Result<()> {
+    if let Some(p) = secret_to {
+        write_secret_sink(p, rotated)?;
     }
-    println!("rotated key {} ({})", rotated.id, rotated.name);
-    println!();
-    println!("  ┌─────────────────────────────────────────────────────────────────┐");
-    println!("  │  NEW CREDENTIAL (shown once — the old one no longer resolves)  │");
-    println!("  └─────────────────────────────────────────────────────────────────┘");
+    if json {
+        let text = match secret_to {
+            None => serde_json::to_string_pretty(rotated)?,
+            Some(_) => serde_json::to_string_pretty(&json_without_secrets(rotated)?)?,
+        };
+        writeln!(out, "{text}")?;
+        return Ok(());
+    }
+    let shown = |v: &str| match secret_to {
+        None => v.to_string(),
+        Some(p) => format!("(written to {})", p.display()),
+    };
+    writeln!(out, "rotated key {} ({})", rotated.id, rotated.name)?;
+    writeln!(out)?;
+    writeln!(
+        out,
+        "  ┌─────────────────────────────────────────────────────────────────┐"
+    )?;
+    writeln!(
+        out,
+        "  │  NEW CREDENTIAL (shown once — the old one no longer resolves)  │"
+    )?;
+    writeln!(
+        out,
+        "  └─────────────────────────────────────────────────────────────────┘"
+    )?;
     if let Some(t) = &rotated.token {
-        println!("  token: {t}");
+        writeln!(out, "  token: {}", shown(t.expose()))?;
         if let Some(exp) = rotated.expires_at {
-            println!("  expires_at: {exp} (unix seconds)");
+            writeln!(out, "  expires_at: {exp} (unix seconds)")?;
         }
     }
     if let Some(s) = &rotated.secret {
-        println!("  secret: {s}");
+        writeln!(out, "  secret: {}", shown(s.expose()))?;
     }
     Ok(())
 }
@@ -782,5 +936,151 @@ mod cli_logic_tests {
             Some(vec!["p1".into()]),
             "a list => exactly those pools"
         );
+    }
+
+    // ── credential output (CREDENTIAL-LOCKDOWN H11) ──────────────────────────────────────────
+
+    const CANARY: &str = "bbk_CANARY_9f3c1e_do_not_print";
+
+    fn created() -> CreatedKeyView {
+        serde_json::from_str(
+            r#"{"id":"vk_1","name":"svc","token":"bbk_CANARY_9f3c1e_do_not_print","expires_at":7,
+                "aws_access_key_id":"AKIA1","aws_secret_access_key":"bbk_CANARY_9f3c1e_do_not_print"}"#,
+        )
+        .unwrap()
+    }
+
+    fn rotated() -> RotatedKeyView {
+        serde_json::from_str(
+            r#"{"id":"vk_1","name":"svc","token":"bbk_CANARY_9f3c1e_do_not_print","expires_at":7}"#,
+        )
+        .unwrap()
+    }
+
+    fn tmp(name: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("busbar-admin-test-{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        d.join(name)
+    }
+
+    #[test]
+    fn default_create_output_is_byte_identical() {
+        let mut out = Vec::new();
+        render_created(&created(), false, None, &mut out).unwrap();
+        let want = [
+            "created key vk_1 (svc)".to_string(),
+            "  expires_at: 7 (unix seconds)".into(),
+            String::new(),
+            "  ┌─────────────────────────────────────────────────────────────┐".into(),
+            "  │  TOKEN (shown once — store it now, it cannot be retrieved)  │".into(),
+            "  └─────────────────────────────────────────────────────────────┘".into(),
+            format!("  token: {CANARY}"),
+            "  aws_access_key_id:     AKIA1".into(),
+            format!("  aws_secret_access_key: {CANARY}  (shown once)"),
+            String::new(),
+        ]
+        .join("\n");
+        assert_eq!(String::from_utf8(out).unwrap(), want);
+
+        let mut out = Vec::new();
+        render_created(&created(), true, None, &mut out).unwrap();
+        let want = format!("{}\n", serde_json::to_string_pretty(&created()).unwrap());
+        assert_eq!(String::from_utf8(out).unwrap(), want);
+    }
+
+    #[test]
+    fn default_rotate_output_is_byte_identical() {
+        let mut out = Vec::new();
+        render_rotated(&rotated(), false, None, &mut out).unwrap();
+        let want = [
+            "rotated key vk_1 (svc)".to_string(),
+            String::new(),
+            "  ┌─────────────────────────────────────────────────────────────────┐".into(),
+            "  │  NEW CREDENTIAL (shown once — the old one no longer resolves)  │".into(),
+            "  └─────────────────────────────────────────────────────────────────┘".into(),
+            format!("  token: {CANARY}"),
+            "  expires_at: 7 (unix seconds)".into(),
+            String::new(),
+        ]
+        .join("\n");
+        assert_eq!(String::from_utf8(out).unwrap(), want);
+    }
+
+    #[test]
+    fn output_secret_to_keeps_every_credential_off_stdout() {
+        for json in [false, true] {
+            let sink = tmp(&format!("create-{json}.json"));
+            let mut out = Vec::new();
+            render_created(&created(), json, Some(&sink), &mut out).unwrap();
+            let shown = String::from_utf8(out).unwrap();
+            assert!(
+                !shown.contains(CANARY),
+                "stdout carried the credential: {shown}"
+            );
+            let file = std::fs::read_to_string(&sink).unwrap();
+            let v: serde_json::Value = serde_json::from_str(&file).unwrap();
+            assert_eq!(v["token"], CANARY);
+            assert_eq!(v["aws_secret_access_key"], CANARY);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                let mode = std::fs::metadata(&sink).unwrap().permissions().mode() & 0o777;
+                assert_eq!(mode, 0o600, "the secret sink must be owner-only");
+            }
+
+            let sink = tmp(&format!("rotate-{json}.json"));
+            let mut out = Vec::new();
+            render_rotated(&rotated(), json, Some(&sink), &mut out).unwrap();
+            let shown = String::from_utf8(out).unwrap();
+            assert!(
+                !shown.contains(CANARY),
+                "stdout carried the credential: {shown}"
+            );
+            let v: serde_json::Value =
+                serde_json::from_str(&std::fs::read_to_string(&sink).unwrap()).unwrap();
+            assert_eq!(v["token"], CANARY);
+        }
+    }
+
+    #[test]
+    fn token_file_is_read_and_its_contents_never_reach_an_error() {
+        let f = tmp("token");
+        std::fs::write(&f, format!("{CANARY}\n")).unwrap();
+        let (t, argv) = resolve_token(None, None, Some(&f)).unwrap();
+        assert_eq!(t, CANARY);
+        assert!(!argv);
+
+        let e = resolve_token(Some("x"), Some(ValueSource::CommandLine), Some(&f)).unwrap_err();
+        assert!(!format!("{e:#}").contains(CANARY));
+
+        let missing = tmp("absent-token");
+        let e = resolve_token(None, None, Some(&missing)).unwrap_err();
+        assert!(format!("{e:#}").contains("--token-file"));
+    }
+
+    #[test]
+    fn token_file_wins_over_the_env_token() {
+        let f = tmp("token-env");
+        std::fs::write(&f, "from-file\r\n").unwrap();
+        let (t, _) =
+            resolve_token(Some("from-env"), Some(ValueSource::EnvVariable), Some(&f)).unwrap();
+        assert_eq!(t, "from-file");
+    }
+
+    #[test]
+    fn only_an_argv_token_is_flagged_for_the_warning() {
+        let m = Cli::command()
+            .try_get_matches_from(["busbar-admin", "--token", "t", "info"])
+            .unwrap();
+        let (_, argv) = resolve_token(Some("t"), m.value_source("token"), None).unwrap();
+        assert!(argv, "--token on argv must warn");
+
+        let m = Cli::command()
+            .try_get_matches_from(["busbar-admin", "info", "--token", "t"])
+            .unwrap();
+        assert_eq!(m.value_source("token"), Some(ValueSource::CommandLine));
+
+        let (_, argv) = resolve_token(Some("t"), Some(ValueSource::EnvVariable), None).unwrap();
+        assert!(!argv, "the env token must not warn");
     }
 }
