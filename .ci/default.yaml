@@ -101,7 +101,9 @@ checks:
       # PAIRED + STRUCTURAL: core's spec at this run's branch.
       B=$(mktemp -d)/busbarAI
       if git clone --depth 1 --branch "$BUSBAR_REF" https://github.com/GetBusbar/busbar.git "$B"; then
-        BUSBAR_SPEC="$B/crates/busbar/src/admin/v1/json/openapi.json"
+        # 1.6.0 moved the admin spec into busbar-core-admin; 1.5.x refs keep the old path.
+        BUSBAR_SPEC="$B/crates/busbar-core-admin/src/v1/json/openapi.json"
+        [ -f "$BUSBAR_SPEC" ] || BUSBAR_SPEC="$B/crates/busbar/src/admin/v1/json/openapi.json"
         [ -f "$BUSBAR_SPEC" ] || { echo "::error::paired core spec not present at $BUSBAR_SPEC"; exit 1; }
         export BUSBAR_SPEC
         echo "committed: v$(jq -r .info.version openapi.json)   paired core ($BUSBAR_REF): v$(jq -r .info.version "$BUSBAR_SPEC")"
