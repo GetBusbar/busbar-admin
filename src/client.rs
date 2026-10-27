@@ -616,6 +616,15 @@ pub struct HookView {
     pub settings_keys: Vec<String>,
     #[serde(default)]
     pub global: bool,
+    /// The `phase:` stage list as configured (empty when unset; then `at:` or the core stages apply).
+    #[serde(default)]
+    pub phase: Vec<String>,
+    /// The stages the hook actually fires at, in pipeline order (the effective answer).
+    #[serde(default)]
+    pub fires_at: Vec<String>,
+    /// The `groups:` caller scope as configured; empty means every caller.
+    #[serde(default)]
+    pub groups: Vec<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -983,6 +992,9 @@ mod spec_contract_tests {
                 timeout_ms: 0,
                 settings_keys: vec!["api_key".into()],
                 global: false,
+                phase: vec![],
+                fires_at: vec!["request".into()],
+                groups: vec![],
             },
         );
         assert_matches(
