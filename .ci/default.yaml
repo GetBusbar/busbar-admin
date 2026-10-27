@@ -51,8 +51,11 @@ checks:
       cargo build --release --locked
       B=$(mktemp -d)/busbarAI
       git clone --depth 1 --branch "$BUSBAR_REF" https://github.com/GetBusbar/busbar.git "$B"
-      (cd "$B" && cargo build --release --bin busbar && target/release/busbar --version)
-      scripts/integration.sh "$B/target/release/busbar" target/release/busbar-admin
+      # The shipped binary is the distribution (dist/default: core plus the standard plugins, busbar
+      # #1659); a ref older than the split builds the root crate as before.
+      if [ -f "$B/dist/default/Cargo.toml" ]; then BB="$B/dist/default"; else BB="$B"; fi
+      (cd "$BB" && cargo build --release --bin busbar && target/release/busbar --version)
+      scripts/integration.sh "$BB/target/release/busbar" target/release/busbar-admin
     requires:
     - cargo
   integration-released:
