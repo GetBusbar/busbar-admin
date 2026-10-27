@@ -676,6 +676,26 @@ mod spec_contract_tests {
         // `GET /hooks/{name}/status`, a separate endpoint this CLI does not surface yet. The key
         // NAMES are modelled anyway (cheap, and it keeps the rename arm honest), so this entry is
         // currently empty — kept as the documented seam for the next one.
+        //
+        // 1.6.0 core adds three required stage fields to a hook row. This client tracks the
+        // released spec (the committed openapi.json, 1.5.5), whose HookView has none of them, so
+        // modelling them now would fail the committed-spec run; model them when openapi.json
+        // moves to 1.6.0. `hooks list` prints the 1.5.5 columns until then.
+        (
+            "HookView",
+            "phase",
+            "1.6.0 addition; modelled when the committed spec moves to 1.6.0",
+        ),
+        (
+            "HookView",
+            "fires_at",
+            "1.6.0 addition; modelled when the committed spec moves to 1.6.0",
+        ),
+        (
+            "HookView",
+            "groups",
+            "1.6.0 addition; modelled when the committed spec moves to 1.6.0",
+        ),
     ];
 
     fn spec() -> serde_json::Value {
