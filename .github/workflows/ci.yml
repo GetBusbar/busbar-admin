@@ -184,7 +184,6 @@ jobs:
       # shape this client actually reads changing underneath it does.
       - name: structural contract check against the PAIRED core spec (BLOCKING)
         if: steps.pair.outcome == 'success'
-        env:
         run: |
           set -eu
           # The spec moved with core's admin extraction (1.6.0: crates/busbar-core-admin); older refs
