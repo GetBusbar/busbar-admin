@@ -185,9 +185,13 @@ jobs:
       - name: structural contract check against the PAIRED core spec (BLOCKING)
         if: steps.pair.outcome == 'success'
         env:
-          BUSBAR_SPEC: busbarAI/crates/busbar/src/admin/v1/json/openapi.json
         run: |
           set -eu
+          # The spec moved with core's admin extraction (1.6.0: crates/busbar-core-admin); older refs
+          # (qa, main) still carry it under crates/busbar.
+          BUSBAR_SPEC=busbarAI/crates/busbar-core-admin/src/v1/json/openapi.json
+          [ -f "$BUSBAR_SPEC" ] || BUSBAR_SPEC=busbarAI/crates/busbar/src/admin/v1/json/openapi.json
+          export BUSBAR_SPEC
           [ -f "$BUSBAR_SPEC" ] || {
             echo "::error::paired core spec not present at $BUSBAR_SPEC"
             exit 1
@@ -200,7 +204,8 @@ jobs:
         continue-on-error: true
         run: |
           set -u
-          paired=busbarAI/crates/busbar/src/admin/v1/json/openapi.json
+          paired=busbarAI/crates/busbar-core-admin/src/v1/json/openapi.json
+          [ -f "$paired" ] || paired=busbarAI/crates/busbar/src/admin/v1/json/openapi.json
           [ -f "$paired" ] || { echo "::warning::paired core spec not present at $paired; skipping"; exit 0; }
           echo "committed: v$(jq -r .info.version openapi.json)   paired core ($BUSBAR_REF): v$(jq -r .info.version "$paired")"
           if diff -u <(jq -S . "$paired") <(jq -S . openapi.json) > /tmp/spec.diff; then
