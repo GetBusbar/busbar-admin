@@ -53,8 +53,13 @@ EOF
 # modern form, ask the engine's own `--validate` (no server, no network, no state), and fall back
 # ONLY on the exact "unknown field `identity-providers`" rejection. Any other validation error is
 # a genuine failure and is surfaced as one.
-write_config() { # $1 = admin_auth grammar: modern | legacy
-  if [ "$1" = modern ]; then
+# From 1.6.0 the version IS the discriminator (see "Which grammar" below). The 1.6.0 operator
+# credential is still `token:` on the `admin-tokens` definition, but ONLY a distribution that links
+# the admin-tokens plugin knows that word: core's bare composition root (no plugins) reads the
+# operator words as empty and rejects `token:` as meaningless (BUSBAR-3015). So the 1.6.0 fixture
+# must be run against the default distribution (dist/default), which CI builds for core >= 1.6.0.
+write_config() { # $1 = grammar: v1.6.0 | modern (1.5.3-1.5.5) | legacy (<=1.5.2)
+  if [ "$1" = v1.6.0 ] || [ "$1" = modern ]; then
     cat > "$BUSBAR_CONFIG" <<EOF
 listen: "127.0.0.1:${PORT}"
 admin_listen: "127.0.0.1:${ADMIN_PORT}"
@@ -96,21 +101,42 @@ EOF
   fi
 }
 
-GRAMMAR=modern
-write_config modern
-if ! "$BUSBAR_BIN" --validate > "$WORK/validate.log" 2>&1; then
-  if grep -q 'unknown field `identity-providers`' "$WORK/validate.log"; then
-    GRAMMAR=legacy
-    write_config legacy
-    if ! "$BUSBAR_BIN" --validate > "$WORK/validate.log" 2>&1; then
-      echo "neither admin_auth grammar validates against this busbar:" >&2
+# ── Which grammar: picked from the core's REPORTED version ─────────────────────────────────────
+# `busbar --version` prints `busbar <semver>`. A core at or past 1.6.0 gets the 1.6.0 fixture and
+# it is held STRICT: `--validate` must accept it, with no fallback to an older grammar (a 1.6.0
+# core that rejects its own fixture is a real failure, never a vintage difference). An older core
+# gets the 1.5.x grammar, where the capability probe above still separates 1.5.3+ from <=1.5.2.
+CORE_VERSION=$("$BUSBAR_BIN" --version | awk '{print $2}')
+[ -n "$CORE_VERSION" ] || { echo "could not read a version from '$BUSBAR_BIN --version'" >&2; exit 1; }
+# `sort -V` puts the smaller of the two first; the core is >= 1.6.0 iff 1.6.0 sorts first (or ties).
+# A pre-release (1.6.0-dev.1) sorts BEFORE 1.6.0 under -V, so the pre-release suffix is cut first:
+# a 1.6.0 pre-release speaks the 1.6.0 grammar.
+CORE_BASE=${CORE_VERSION%%-*}
+if [ "$(printf '%s\n%s\n' 1.6.0 "$CORE_BASE" | sort -V | head -n1)" = 1.6.0 ]; then
+  GRAMMAR=v1.6.0
+  write_config v1.6.0
+  if ! "$BUSBAR_BIN" --validate > "$WORK/validate.log" 2>&1; then
+    echo "the 1.6.0 config fixture was rejected by busbar $CORE_VERSION --validate:" >&2
+    cat "$WORK/validate.log" >&2
+    exit 1
+  fi
+else
+  GRAMMAR=modern
+  write_config modern
+  if ! "$BUSBAR_BIN" --validate > "$WORK/validate.log" 2>&1; then
+    if grep -q 'unknown field `identity-providers`' "$WORK/validate.log"; then
+      GRAMMAR=legacy
+      write_config legacy
+      if ! "$BUSBAR_BIN" --validate > "$WORK/validate.log" 2>&1; then
+        echo "neither admin_auth grammar validates against this busbar:" >&2
+        cat "$WORK/validate.log" >&2
+        exit 1
+      fi
+    else
+      echo "config fixture rejected by busbar --validate (not a grammar-vintage difference):" >&2
       cat "$WORK/validate.log" >&2
       exit 1
     fi
-  else
-    echo "config fixture rejected by busbar --validate (not a grammar-vintage difference):" >&2
-    cat "$WORK/validate.log" >&2
-    exit 1
   fi
 fi
 echo "admin_auth config grammar: $GRAMMAR ($("$BUSBAR_BIN" --version))"

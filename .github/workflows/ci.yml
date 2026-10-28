@@ -65,13 +65,26 @@ jobs:
         working-directory: busbar-admin
         run: cargo build --release --locked
       - name: Build busbar (from the sibling checkout)
+        id: engine
         working-directory: busbarAI
         run: |
-          cargo build --release --bin busbar
-          target/release/busbar --version
+          set -euo pipefail
+          # From 1.6.0 core's own `busbar` binary is the bare composition root: no plugins linked, so
+          # no operator credential exists and the admin-tokens provider cannot be configured. The
+          # engine an operator runs is the DEFAULT DISTRIBUTION (dist/default, its own workspace).
+          # Older refs (qa, main) have no dist/default and build the root as before.
+          if [ -f dist/default/Cargo.toml ]; then
+            (cd dist/default && cargo build --release --bin busbar)
+            bin="$PWD/dist/default/target/release/busbar"
+          else
+            cargo build --release --bin busbar
+            bin="$PWD/target/release/busbar"
+          fi
+          "$bin" --version
+          echo "bin=$bin" >> "$GITHUB_OUTPUT"
       - name: Drive every command against the paired gateway
         working-directory: busbar-admin
-        run: scripts/integration.sh ../busbarAI/target/release/busbar target/release/busbar-admin
+        run: scripts/integration.sh "${{ steps.engine.outputs.bin }}" target/release/busbar-admin
 
   integration-released:
     # ── NON-BLOCKING (continue-on-error). Last RELEASED busbar. ──────────────────────────────────
@@ -105,15 +118,10 @@ jobs:
 
   spec-drift:
     # The admin client is hand-rolled against openapi.json (committed at the repo root).
-    # Fail when the latest busbar release ships a NEWER spec version than the one committed,
-    # so drift is visible instead of silent. Degrades to a warning if the GitHub API is
-    # unavailable or rate-limited (keeps the check non-flaky).
-    #
-    # RELEASED-vs-PAIRED, deliberately kept as-is for the BLOCKING half. Unlike `integration`, the
-    # released comparison here is asking the right question: openapi.json is a COMMITTED ARTEFACT
-    # copied out of core, and "have we refreshed it for the engine that has actually shipped?" is a
-    # real, answerable obligation. It cannot be red for being ahead either — the client only ever
-    # gets ahead by someone copying a newer spec in, which they do together with the release.
+    # Fail when the committed spec is not the spec of the core version this admin pins
+    # (`.busbar-core`), so drift between the two is visible instead of silent. PINNED, not
+    # "latest release": the admin for 1.6.0 targets the 1.6.0 core, which is not released for most
+    # of the cycle, and the question that matters is "is the spec the one for the core we target?".
     #
     # What it CANNOT see is structural drift under an unchanged `info.version` — and that was not
     # hypothetical. Core `dev` and this repo's committed copy were BOTH stamped 1.5.2 while core had
@@ -142,32 +150,25 @@ jobs:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - name: compare committed spec version to the latest busbar release
-        env:
-          GH_TOKEN: ${{ github.token }}
+      - name: compare committed spec version to the busbar core this admin pins
         run: |
-          set -u
+          set -eu
+          # The admin targets ONE core version: the one in `.busbar-core`. 1.6.0 admin targets the
+          # 1.6.0 core, which is ahead of the latest release for the whole cycle, so comparing against
+          # "latest release" could only ever be red mid-cycle. The committed spec must be the pinned
+          # core's, and the pin must be a plain semver.
+          pin=$(tr -d ' \t\r\n' < .busbar-core)
           committed=$(jq -r .info.version openapi.json)
-          echo "committed spec version: $committed"
-          resp=$(curl -sS --max-time 30 \
-            -H "Authorization: Bearer $GH_TOKEN" \
-            -H "Accept: application/vnd.github+json" \
-            https://api.github.com/repos/GetBusbar/busbar/releases/latest) || {
-              echo "::warning::could not reach the GitHub API to check the latest busbar release; skipping spec-drift check"
-              exit 0
-            }
-          latest=$(echo "$resp" | jq -r '.tag_name // empty' | sed 's/^v//')
-          if [ -z "$latest" ]; then
-            echo "::warning::GitHub API returned no usable release tag (rate-limited?); skipping spec-drift check"
-            echo "$resp" | head -c 500
-            exit 0
-          fi
-          echo "latest busbar release: $latest"
-          if [ "$committed" != "$latest" ]; then
-            echo "::error::committed openapi.json is v$committed but the latest busbar release is v$latest — refresh the spec and re-audit src/client.rs"
+          echo "pinned core: $pin   committed spec version: $committed"
+          if ! printf '%s' "$pin" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "::error::.busbar-core must hold one core version (x.y.z), got '$pin'"
             exit 1
           fi
-          echo "spec is current (v$committed)"
+          if [ "$committed" != "$pin" ]; then
+            echo "::error::committed openapi.json is v$committed but this admin pins busbar core v$pin: refresh the spec and re-audit src/client.rs, or move .busbar-core"
+            exit 1
+          fi
+          echo "spec is the pinned core's (v$pin)"
 
       # ── PAIRED + STRUCTURAL (see the job comment above) ─────────────────────────────────────────
       - name: Checkout busbar (sibling, SAME branch as this run)
