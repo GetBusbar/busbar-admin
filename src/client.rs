@@ -198,10 +198,27 @@ impl Client {
         Ok(())
     }
 
+    /// Decode a JSON body. The error NEVER carries the body or serde's own message: a mint or
+    /// rotate body holds a once-shown credential, and serde quotes the offending value
+    /// (`invalid type: string "…"`). Only the error class, its position and the body length are
+    /// reported, which is enough to diagnose a version skew without printing a secret.
     fn decode<T: DeserializeOwned>(resp: Response) -> Result<T> {
         let body = resp.text().context("reading the response body")?;
-        serde_json::from_str(&body)
-            .with_context(|| format!("decoding the gateway response: {body}"))
+        serde_json::from_str(&body).map_err(|e| {
+            let class = match e.classify() {
+                serde_json::error::Category::Io => "an I/O error",
+                serde_json::error::Category::Syntax => "invalid JSON",
+                serde_json::error::Category::Data => "an unexpected shape",
+                serde_json::error::Category::Eof => "a truncated body",
+            };
+            anyhow!(
+                "decoding the gateway response: {class} at line {} column {} ({} bytes; the body \
+                 is withheld because it may carry a credential)",
+                e.line(),
+                e.column(),
+                body.len()
+            )
+        })
     }
 
     // ── Typed endpoint methods ───────────────────────────────────────────────────────────────
@@ -299,6 +316,33 @@ pub struct ConfigApplyView {
 }
 
 // ── Contract-mirroring request/response types ────────────────────────────────────────────────
+
+/// A once-shown credential the gateway minted (a signed token, an AWS secret, a legacy secret).
+///
+/// It (de)serializes as the bare string, so `--json` output stays byte-identical, but its `Debug`
+/// prints `<redacted>` and it has no `Display`: rendering it takes an explicit [`Secret::expose`].
+#[derive(Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(transparent)]
+pub struct Secret(String);
+
+impl Secret {
+    /// The credential itself. Every call site is a deliberate print or write of the secret.
+    pub fn expose(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for Secret {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("<redacted>")
+    }
+}
+
+impl From<&str> for Secret {
+    fn from(s: &str) -> Self {
+        Secret(s.to_string())
+    }
+}
 
 #[derive(Deserialize)]
 struct ErrorEnvelope {
@@ -423,7 +467,7 @@ pub struct CreatedKeyView {
     #[serde(default)]
     pub created_at: u64,
     /// The busbar-signed token — shown exactly once.
-    pub token: String,
+    pub token: Secret,
     /// Unix-seconds expiry of the signed token.
     #[serde(default)]
     pub expires_at: u64,
@@ -433,7 +477,7 @@ pub struct CreatedKeyView {
     #[serde(default)]
     pub aws_access_key_id: Option<String>,
     #[serde(default)]
-    pub aws_secret_access_key: Option<String>,
+    pub aws_secret_access_key: Option<Secret>,
 }
 
 /// `POST /keys/{id}/rotate` response: metadata + the once-shown fresh credential — exactly one
@@ -455,11 +499,11 @@ pub struct RotatedKeyView {
     #[serde(default)]
     pub created_at: u64,
     #[serde(default)]
-    pub token: Option<String>,
+    pub token: Option<Secret>,
     #[serde(default)]
     pub expires_at: Option<u64>,
     #[serde(default)]
-    pub secret: Option<String>,
+    pub secret: Option<Secret>,
 }
 
 /// `POST /keys/{id}/revoke` response: the id, now durably denylisted.
@@ -616,6 +660,15 @@ pub struct HookView {
     pub settings_keys: Vec<String>,
     #[serde(default)]
     pub global: bool,
+    /// The `phase:` stage list as configured (empty when unset; then `at:` or the core stages apply).
+    #[serde(default)]
+    pub phase: Vec<String>,
+    /// The stages the hook actually fires at, in pipeline order (the effective answer).
+    #[serde(default)]
+    pub fires_at: Vec<String>,
+    /// The `groups:` caller scope as configured; empty means every caller.
+    #[serde(default)]
+    pub groups: Vec<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -983,6 +1036,9 @@ mod spec_contract_tests {
                 timeout_ms: 0,
                 settings_keys: vec!["api_key".into()],
                 global: false,
+                phase: vec![],
+                fires_at: vec!["request".into()],
+                groups: vec![],
             },
         );
         assert_matches(
@@ -1060,7 +1116,7 @@ mod spec_shape_tests {
             r#"{"id":"vk_1","name":"n","token":"bbk_abc","expires_at":1785772871,"state":"active"}"#,
         )
         .expect("token-shaped CreatedKeyView must decode");
-        assert_eq!(c.token, "bbk_abc");
+        assert_eq!(c.token.expose(), "bbk_abc");
         assert_eq!(c.expires_at, 1785772871_u64);
     }
 
@@ -1123,7 +1179,7 @@ mod spec_shape_tests {
         // so a token-only rotate decodes without a phantom `secret`.
         let r: RotatedKeyView =
             serde_json::from_str(r#"{"id":"vk_1","name":"n","token":"bbk_new"}"#).unwrap();
-        assert_eq!(r.token.as_deref(), Some("bbk_new"));
+        assert_eq!(r.token.as_ref().map(Secret::expose), Some("bbk_new"));
         assert_eq!(r.secret, None);
     }
 
@@ -1163,5 +1219,122 @@ mod spec_shape_tests {
             v.schema_error.as_deref(),
             Some("settings_schema is not valid JSON")
         );
+    }
+}
+
+/// Credential-echo canaries (CREDENTIAL-LOCKDOWN H1, H11). Each plants a known credential where
+/// the gateway would put a minted one and asserts it never reaches an error chain or a `Debug`
+/// rendering — the two places a CLI's output ends up in CI logs and bug reports.
+#[cfg(test)]
+mod credential_echo_tests {
+    use super::*;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+
+    const CANARY: &str = "bbk_CANARY_9f3c1e_do_not_print";
+
+    /// A one-shot HTTP/1.1 server answering every request with `200` and `body`.
+    fn serve_once(body: &'static str) -> String {
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = l.local_addr().unwrap();
+        std::thread::spawn(move || {
+            if let Ok((mut s, _)) = l.accept() {
+                let mut buf = Vec::new();
+                let mut chunk = [0u8; 1024];
+                while !buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match s.read(&mut chunk) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                    }
+                }
+                let _ = write!(
+                    s,
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    fn client(endpoint: &str) -> Client {
+        Client::new(endpoint, "admin-token", Tls::default()).unwrap()
+    }
+
+    fn assert_no_canary(what: &str, e: &anyhow::Error) {
+        for rendered in [format!("{e}"), format!("{e:#}"), format!("{e:?}")] {
+            assert!(
+                !rendered.contains(CANARY),
+                "{what}: the minted credential reached the error text: {rendered}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_mint_body_that_fails_to_decode_never_echoes_the_token() {
+        // Version skew: the token decodes fine but a sibling field has the wrong type. The error
+        // used to carry the WHOLE body, minted token included.
+        let ep = serve_once(
+            r#"{"id":"vk_1","name":"n","token":"bbk_CANARY_9f3c1e_do_not_print","expires_at":"soon"}"#,
+        );
+        let req = CreateKeyReq {
+            name: "n".into(),
+            allowed_pools: None,
+            group: None,
+            parent: None,
+            expires_in: None,
+            expires_at: None,
+            labels: Default::default(),
+            issue_aws_credential: false,
+        };
+        let e = client(&ep).create_key(&req).unwrap_err();
+        assert_no_canary("create_key decode error", &e);
+        assert!(format!("{e:#}").contains("decoding the gateway response"));
+    }
+
+    #[test]
+    fn a_decode_error_on_the_credential_itself_never_echoes_it() {
+        // serde's own message quotes the offending value (`invalid type: string "…"`), so the
+        // fix cannot simply drop the body and keep serde's Display.
+        let ep = serve_once(
+            r#"{"id":"vk_1","name":"n","token":"t","expires_at":"bbk_CANARY_9f3c1e_do_not_print"}"#,
+        );
+        let e = client(&ep).rotate_key("vk_1").unwrap_err();
+        assert_no_canary("rotate_key decode error", &e);
+    }
+
+    #[test]
+    fn debug_of_a_minted_view_redacts_every_credential() {
+        let c: CreatedKeyView = serde_json::from_str(
+            r#"{"id":"vk_1","name":"n","token":"bbk_CANARY_9f3c1e_do_not_print",
+                "aws_access_key_id":"AKIA1","aws_secret_access_key":"bbk_CANARY_9f3c1e_do_not_print"}"#,
+        )
+        .unwrap();
+        let r: RotatedKeyView = serde_json::from_str(
+            r#"{"id":"vk_1","name":"n","token":"bbk_CANARY_9f3c1e_do_not_print",
+                "secret":"bbk_CANARY_9f3c1e_do_not_print"}"#,
+        )
+        .unwrap();
+        for d in [
+            format!("{c:?}"),
+            format!("{c:#?}"),
+            format!("{r:?}"),
+            format!("{r:#?}"),
+        ] {
+            assert!(
+                !d.contains(CANARY),
+                "Debug printed a minted credential: {d}"
+            );
+        }
+    }
+
+    #[test]
+    fn json_output_still_carries_the_minted_credential_verbatim() {
+        // `--json` is the documented way to capture the once-shown secret; redaction must be
+        // confined to Debug and errors and leave the wire shape byte-identical.
+        let raw = r#"{"id":"vk_1","name":"n","token":"bbk_CANARY_9f3c1e_do_not_print"}"#;
+        let c: CreatedKeyView = serde_json::from_str(raw).unwrap();
+        let v = serde_json::to_value(&c).unwrap();
+        assert_eq!(v["token"], CANARY);
     }
 }

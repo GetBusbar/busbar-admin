@@ -34,6 +34,8 @@ Every global flag has an environment-variable fallback. Resolution order is
 | --------------- | --------------------- | -------------------------------------------------------------- |
 | `--endpoint`    | `BUSBAR_ENDPOINT`     | Gateway base URL, e.g. `http://localhost:8081`                 |
 | `--token`       | `BUSBAR_ADMIN_TOKEN`  | Admin token (sent as `x-admin-token` and `Authorization: Bearer`) |
+| `--token-file` | —                     | Read the admin token from a file (keeps it out of `ps` and shell history; `--token` on argv prints a warning) |
+| `--output-secret-to` | —               | `keys create` / `keys rotate`: write the minted credential (full JSON view, mode 0600) to this file or `/dev/fd/N` instead of stdout |
 | `--insecure`    | —                     | Skip TLS certificate verification (**dev only**)               |
 | `--ca-cert`     | —                     | Trust a private admin CA (PEM file)                            |
 | `--client-cert` | —                     | Client certificate (PEM) for mTLS (with `--client-key`)        |
