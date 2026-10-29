@@ -34,7 +34,7 @@ cat > "$BUSBAR_PROVIDERS" <<EOF
 mock:
   protocol: anthropic
   base_url: "http://127.0.0.1:9"
-  api_key_env: MOCK_KEY
+  api_key: { env: MOCK_KEY }
 EOF
 # 1.5.1: the built-in `keys` verifier requires an explicit signing key — busbar no longer
 # auto-generates one. Mint a real ed25519 secret via the shipping command (secret -> stdout,
@@ -208,7 +208,7 @@ pass "config version + show"
 # Exercises the mutating path AND the `applied` in-band success check (a 200/applied=false must be
 # a nonzero exit, never a silent "applied").
 CFG=$("$ADM" config show --json)
-python3 -c "import json,sys; c=json.load(sys.stdin); json.dump({'config':c,'providers':{'mock':{'protocol':'anthropic','base_url':'http://127.0.0.1:9','api_key_env':'MOCK_KEY'}}}, open('$WORK/apply.json','w'))" <<<"$CFG"
+python3 -c "import json,sys; c=json.load(sys.stdin); json.dump({'config':c,'providers':{'mock':{'protocol':'anthropic','base_url':'http://127.0.0.1:9','api_key':{'env':'MOCK_KEY'}}}}, open('$WORK/apply.json','w'))" <<<"$CFG"
 if "$ADM" config apply "$WORK/apply.json" >/dev/null 2>"$WORK/apply.err"; then
   pass "config apply (applied=true)"
 else
