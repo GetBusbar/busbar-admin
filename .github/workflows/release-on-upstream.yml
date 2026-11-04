@@ -2,8 +2,8 @@ name: release-on-upstream
 
 # Cut this CLI's next release when busbar core ships. The admin client (src/client.rs) is hand-rolled
 # against the committed openapi.json, and ci.yml's spec-drift job fails when that spec falls behind
-# core's latest release. So on a new core release this refreshes openapi.json, proves the CLI still
-# builds against it, then patch-bumps + tags v* — release.yml then builds + uploads the binaries.
+# the pinned core. A new core release refreshes openapi.json AND .busbar-core, runs the actual
+# structural contract tests and paired integration, then patch-bumps + tags v*.
 #
 # There is no code generator here: a refreshed spec never rewrites client.rs, so this only ever
 # patch-bumps (semantic client changes are a human's job, surfaced by the failing spec-drift check).
@@ -13,7 +13,7 @@ name: release-on-upstream
 #   - schedule: reads GetBusbar/busbar's latest release and acts ONLY if its spec version is newer
 #     than the committed openapi.json — an idle day is a no-op, so cron can never runaway-tag.
 #   - workflow_dispatch: always acts (a human explicitly asked).
-# The final gate is a green `cargo build --locked` on the refreshed spec: a broken build never tags.
+# The shared qualification script must succeed before the release script can push or tag.
 on:
   repository_dispatch:
     types: [upstream-release]
@@ -37,7 +37,7 @@ jobs:
   cut:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: main
           fetch-depth: 0
@@ -74,6 +74,9 @@ jobs:
             echo "::notice::could not resolve a core release tag -> nothing to do"
             echo "proceed=no" >> "$GITHUB_OUTPUT"; exit 0
           fi
+          [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || {
+            echo "::error::core release tag must be vX.Y.Z"; exit 1;
+          }
           ver="${tag#v}"
           echo "target core tag: $tag (spec version $ver)"
           proceed=no
@@ -90,39 +93,19 @@ jobs:
             echo "ver=$ver"
           } >> "$GITHUB_OUTPUT"
 
-      - name: Refresh spec, prove it builds, and cut a patch release
+      - name: Checkout the exact target core release
+        if: steps.resolve.outputs.proceed == 'yes'
+        uses: actions/checkout@v7
+        with:
+          repository: GetBusbar/busbar
+          ref: ${{ steps.resolve.outputs.tag }}
+          path: busbarAI
+
+      - name: Refresh spec and pin, qualify against core, then cut a patch release
         if: steps.resolve.outputs.proceed == 'yes'
         env:
           GH_TOKEN: ${{ secrets.RELEASE_DISPATCH_TOKEN }}
           CORE_TAG: ${{ steps.resolve.outputs.tag }}
-          CORE_VER: ${{ steps.resolve.outputs.ver }}
         run: |
           set -euo pipefail
-          gh release download "$CORE_TAG" --repo GetBusbar/busbar \
-            --pattern "busbar-openapi-v${CORE_VER}.json" --output openapi.json.new
-          mv openapi.json.new openapi.json
-
-          if git diff --quiet -- openapi.json; then
-            echo "::notice::spec already current -> idempotent no-op"; exit 0
-          fi
-
-          # Green gate: the hand-rolled client must still build against the refreshed spec.
-          cargo build --locked --verbose
-
-          next="$(git tag -l 'v*' --sort=-v:refname | head -1)"
-          base="${next#v}"; IFS=. read -r MA MI PA <<< "$base"
-          next="v${MA}.${MI}.$((PA + 1))"
-          if git rev-parse -q --verify "refs/tags/${next}" >/dev/null; then
-            echo "::notice::${next} already exists -> idempotent no-op"; exit 0
-          fi
-          nver="${next#v}"
-
-          # Bump the package version; a plain build re-syncs Cargo.lock so release.yml's --locked holds.
-          sed -i -E "s/^version = \"[^\"]*\"/version = \"${nver}\"/" Cargo.toml
-          cargo build
-          git add openapi.json Cargo.toml Cargo.lock
-          git commit -m "release: ${next} — refresh openapi.json to busbar ${CORE_TAG}"
-          git push origin HEAD:main
-          git tag "$next"
-          git push origin "refs/tags/${next}"
-          echo "::notice::pushed ${next} — release.yml will build + upload the binaries"
+          bash scripts/release-upstream.sh "$CORE_TAG" "$GITHUB_WORKSPACE/busbarAI"

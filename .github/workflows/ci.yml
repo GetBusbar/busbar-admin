@@ -2,17 +2,23 @@ name: CI
 
 on:
   push:
-    branches: [main, dev]
+    branches: [main, dev, qa]
   pull_request:
+    branches: [main, dev, qa]
 
 env:
   CARGO_TERM_COLOR: always
+  # Which busbar core ref this run is PAIRED with. On a push it is this branch (dev → core dev,
+  # qa → core qa, main → core main). On a pull_request `github.ref_name` is the synthetic
+  # `<n>/merge` ref, which does not exist in core — so pair with the PR's TARGET branch instead,
+  # which is the branch this work is about to become.
+  BUSBAR_REF: ${{ github.base_ref || github.ref_name }}
 
 jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
@@ -23,23 +29,80 @@ jobs:
         run: cargo clippy --all-targets -- -D warnings
       - name: build
         run: cargo build --locked --verbose
-      # Includes tests/openapi_conformance.rs, the SHAPE gate: it loads the committed openapi.json
-      # and checks every serde type in src/client.rs against its schema (field set, required vs
-      # nullable, round trip, endpoint wiring). The spec-drift job below only compares a version
-      # STRING, so this is the check that fails when a struct drifts from the spec in the same
-      # commit. Keep `cargo test` in this workflow: it is the only thing running that gate.
       - name: test
         run: cargo test --locked --verbose
+      - name: Release and integration caller regressions
+        run: |
+          bash scripts/tests/release-upstream.sh
+          bash scripts/tests/integration.sh
 
   integration:
-    # BIDIRECTIONAL TESTING (matches how the plugin repos test themselves against busbar): download
-    # the latest RELEASED busbar, boot it, and drive EVERY busbar-admin command against it, asserting
-    # real effects. Catches client drift a `cargo build` never would — a renamed field, a changed
-    # status code, a broken auth header. (busbar core's own dev-gate runs the SAME scripts/
-    # integration.sh against the freshly-built engine, the reverse direction.)
+    # ── THE RELEASE GATE (blocking). PAIRED engine, not a released one. ──────────────────────────
+    # Check out GetBusbar/busbar at the SAME BRANCH as this run, build it from source, boot it, and
+    # drive keys, inspection, and config apply against it, asserting real effects. Catches client drift a
+    # `cargo build` never would — a renamed field, a changed status code, a broken auth header.
+    #
+    # Why same-branch rather than `gh release download`: the contract that actually has to hold is
+    # "this client works with the engine it will ship BESIDE". Pinning to the last release makes
+    # that contract untestable during a cycle — busbar 1.5.3 retired the inline `auth.admin_auth:`
+    # grammar and the fixture moved with it, so a released 1.5.2 binary rejects the config outright
+    # and the gate measures engine vintage rather than client correctness. Every plugin repo pairs
+    # same-branch via core's reusable plugin-ci.yml (`busbar_ref: ${{ github.ref_name }}`).
+    # The `integration-released` job below keeps the
+    # OTHER, genuinely different question ("does today's client work with the gateway users have
+    # TODAY?") answered — non-blocking, because its answer is legitimately allowed to be "no".
+    name: integration (paired busbar @ ${{ github.base_ref || github.ref_name }})
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
+        with:
+          path: busbar-admin
+      - name: Checkout busbar (sibling, SAME branch as this run)
+        uses: actions/checkout@v7
+        with:
+          repository: GetBusbar/busbar
+          ref: ${{ env.BUSBAR_REF }}
+          path: busbarAI
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build busbar-admin
+        working-directory: busbar-admin
+        run: cargo build --release --locked
+      - name: Build busbar (from the sibling checkout)
+        id: engine
+        working-directory: busbarAI
+        run: |
+          set -euo pipefail
+          # From 1.6.0 core's own `busbar` binary is the bare composition root: no plugins linked, so
+          # no operator credential exists and the admin-tokens provider cannot be configured. The
+          # engine an operator runs is the DEFAULT DISTRIBUTION (dist/default, its own workspace).
+          # Older refs (qa, main) have no dist/default and build the root as before.
+          if [ -f dist/default/Cargo.toml ]; then
+            (cd dist/default && cargo build --release --bin busbar)
+            bin="$PWD/dist/default/target/release/busbar"
+          else
+            cargo build --release --bin busbar
+            bin="$PWD/target/release/busbar"
+          fi
+          "$bin" --version
+          echo "bin=$bin" >> "$GITHUB_OUTPUT"
+      - name: Exercise keys, inspection, and config apply against the paired gateway
+        working-directory: busbar-admin
+        run: scripts/integration.sh "${{ steps.engine.outputs.bin }}" target/release/busbar-admin
+
+  integration-released:
+    # ── NON-BLOCKING (continue-on-error). Last RELEASED busbar. ──────────────────────────────────
+    # Deliberately NOT a release gate. It answers the question same-branch pairing cannot: "does
+    # the client we are about to ship still work against the gateway an operator has installed
+    # right now?" That is real information — but it is ALLOWED TO BE RED mid-cycle, whenever the
+    # client has legitimately moved ahead of the last release. If this job ever blocks, the whole
+    # fleet inherits a permanently-red gate, which is exactly the failure this split fixes.
+    # Read its result as a compatibility REPORT, never as a reason to stop a release.
+    name: integration vs last RELEASED busbar (informational — never blocks)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Build busbar-admin
@@ -54,42 +117,138 @@ jobs:
           tar -xzf /tmp/busbar-dl/busbar-x86_64-unknown-linux-gnu.tar.gz -C /tmp/busbar-dl
           chmod +x /tmp/busbar-dl/busbar
           /tmp/busbar-dl/busbar --version
-      - name: Drive every command against the real gateway
+      - name: Exercise keys, inspection, and config apply against the released gateway
         run: scripts/integration.sh /tmp/busbar-dl/busbar target/release/busbar-admin
 
   spec-drift:
     # The admin client is hand-rolled against openapi.json (committed at the repo root).
-    # This job answers "is the committed spec CURRENT?" only. Whether src/client.rs still MATCHES
-    # that spec is a separate question, answered by tests/openapi_conformance.rs in the build job.
-    # Fail when the latest busbar release ships a NEWER spec version than the one committed,
-    # so drift is visible instead of silent. Degrades to a warning if the GitHub API is
-    # unavailable or rate-limited (keeps the check non-flaky).
+    # Fail when the committed spec is not the spec of the core version this admin pins
+    # (`.busbar-core`), so drift between the two is visible instead of silent. PINNED, not
+    # "latest release": the admin for 1.6.0 targets the 1.6.0 core, which is not released for most
+    # of the cycle, and the question that matters is "is the spec the one for the core we target?".
+    #
+    # What it CANNOT see is structural drift under an unchanged `info.version` — and that was not
+    # hypothetical. Core `dev` and this repo's committed copy were BOTH stamped 1.5.2 while core had
+    # already replaced the hook `settings` bag with `settings_keys` (and added `drift_keys` to the
+    # hooks-status body). A version-only comparison can never go red on that, and a check that
+    # cannot fail is the same defect class as a gate that reports green having run nothing.
+    #
+    # So the blind spot is closed by a SECOND, PAIRED, BLOCKING step: `cargo test spec_contract`
+    # with `BUSBAR_SPEC` pointed at core's own generated spec at this run's branch. Those tests
+    # compare the structs in `src/client.rs` against the spec document field by field — no phantom
+    # fields (the anti-RENAME arm), and no REQUIRED field silently ignored (the anti-BLIND-SPOT
+    # arm) — with the modelled field set derived by serializing the real structs so it cannot drift
+    # from the types.
+    #
+    # This one CAN block without being permanently red, which a whole-document diff cannot. The
+    # difference is scope: a diff compares EVERYTHING, so core legitimately racing ahead mid-cycle
+    # with new endpoints turns it red for a reason nobody should act on. The contract test
+    # is scoped to what this client actually CONSUMES, so a new endpoint or a new optional field in
+    # core is invisible to it, and only a removal, a rename, or a new required field this client
+    # drops on the floor can fail it. Those are exactly the changes a human must act on.
+    #
+    # The whole-document diff is kept below it, still informational, as the context you want when
+    # the blocking step tells you something moved.
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - name: compare committed spec version to the latest busbar release
-        env:
-          GH_TOKEN: ${{ github.token }}
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: compare committed spec version to the busbar core this admin pins
         run: |
-          set -u
+          set -eu
+          # The admin targets ONE core version: the one in `.busbar-core`. 1.6.0 admin targets the
+          # 1.6.0 core, which is ahead of the latest release for the whole cycle, so comparing against
+          # "latest release" could only ever be red mid-cycle. The committed spec must be the pinned
+          # core's, and the pin must be a plain semver.
+          pin=$(tr -d ' \t\r\n' < .busbar-core)
           committed=$(jq -r .info.version openapi.json)
-          echo "committed spec version: $committed"
-          resp=$(curl -sS --max-time 30 \
-            -H "Authorization: Bearer $GH_TOKEN" \
-            -H "Accept: application/vnd.github+json" \
-            https://api.github.com/repos/GetBusbar/busbar/releases/latest) || {
-              echo "::warning::could not reach the GitHub API to check the latest busbar release; skipping spec-drift check"
-              exit 0
-            }
-          latest=$(echo "$resp" | jq -r '.tag_name // empty' | sed 's/^v//')
-          if [ -z "$latest" ]; then
-            echo "::warning::GitHub API returned no usable release tag (rate-limited?); skipping spec-drift check"
-            echo "$resp" | head -c 500
-            exit 0
-          fi
-          echo "latest busbar release: $latest"
-          if [ "$committed" != "$latest" ]; then
-            echo "::error::committed openapi.json is v$committed but the latest busbar release is v$latest — refresh the spec and re-audit src/client.rs"
+          echo "pinned core: $pin   committed spec version: $committed"
+          if ! printf '%s' "$pin" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "::error::.busbar-core must hold one core version (x.y.z), got '$pin'"
             exit 1
           fi
-          echo "spec is current (v$committed)"
+          if [ "$committed" != "$pin" ]; then
+            echo "::error::committed openapi.json is v$committed but this admin pins busbar core v$pin: refresh the spec and re-audit src/client.rs, or move .busbar-core"
+            exit 1
+          fi
+          echo "spec is the pinned core's (v$pin)"
+
+      # ── PAIRED + STRUCTURAL (see the job comment above) ─────────────────────────────────────────
+      - name: Checkout busbar (sibling, SAME branch as this run)
+        id: pair
+        uses: actions/checkout@v7
+        with:
+          repository: GetBusbar/busbar
+          ref: ${{ env.BUSBAR_REF }}
+          path: busbarAI
+
+      # BLOCKING. Consumption-scoped, so core being ahead mid-cycle does not make it red — only a
+      # shape this client actually reads changing underneath it does.
+      - name: structural contract check against the PAIRED core spec (BLOCKING)
+        run: |
+          set -eu
+          # The spec moved with core's admin extraction (1.6.0: crates/busbar-core-admin); older refs
+          # (qa, main) still carry it under crates/busbar.
+          BUSBAR_SPEC=busbarAI/crates/busbar-core-admin/src/v1/json/openapi.json
+          [ -f "$BUSBAR_SPEC" ] || BUSBAR_SPEC=busbarAI/crates/busbar/src/admin/v1/json/openapi.json
+          export BUSBAR_SPEC
+          [ -f "$BUSBAR_SPEC" ] || {
+            echo "::error::paired core spec not present at $BUSBAR_SPEC"
+            exit 1
+          }
+          echo "committed: v$(jq -r .info.version openapi.json)   paired core ($BUSBAR_REF): v$(jq -r .info.version "$BUSBAR_SPEC")"
+          echo "(version stamps are NOT what this step checks — it compares src/client.rs to the spec's schemas)"
+          cargo test --locked spec_contract -- --nocapture
+
+      - name: structural diff against the PAIRED core spec (informational — never blocks)
+        continue-on-error: true
+        run: |
+          set -u
+          paired=busbarAI/crates/busbar-core-admin/src/v1/json/openapi.json
+          [ -f "$paired" ] || paired=busbarAI/crates/busbar/src/admin/v1/json/openapi.json
+          [ -f "$paired" ] || { echo "::warning::paired core spec not present at $paired; skipping"; exit 0; }
+          echo "committed: v$(jq -r .info.version openapi.json)   paired core ($BUSBAR_REF): v$(jq -r .info.version "$paired")"
+          if diff -u <(jq -S . "$paired") <(jq -S . openapi.json) > /tmp/spec.diff; then
+            echo "no structural drift against the paired core spec"
+          else
+            echo "::warning::committed openapi.json differs STRUCTURALLY from core@$BUSBAR_REF — expected mid-cycle; refresh + re-audit src/client.rs before the release"
+            head -c 20000 /tmp/spec.diff
+          fi
+
+  # COVERAGE — instrumented run of the same workspace suite the `build` job's `cargo test` runs,
+  # uploaded to Codecov for the README badge and per-PR line-coverage context. Deliberately ADDITIVE
+  # and NON-GATING:
+  #
+  #   * It is a SEPARATE job (not a required check and not wired into any other job's `needs`), so it
+  #     can never turn `dev`/`qa`/`main` red. Coverage reporting is an OBSERVATION, not a correctness
+  #     gate — the gate stays `build`/`integration`/`spec-drift`, which this must never mask or block.
+  #   * It is a SEPARATE job, not a step folded into `build`, on purpose: `cargo llvm-cov` compiles
+  #     with `-C instrument-coverage` and drops `*.profraw` files; isolating it keeps `build` clean.
+  #   * The upload uses `fail_ci_if_error: false` so a Codecov outage or a tokenless-rate-limit is a
+  #     no-op here, not a red job — a reporting dependency must never be able to fail the build.
+  #
+  # busbar-admin's tests need no service containers or test env, so — unlike core's coverage job —
+  # this one mirrors nothing extra; it just runs the same workspace suite under instrumentation.
+  coverage:
+    name: coverage (llvm-cov · codecov)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@cargo-llvm-cov
+      - name: Collect coverage (workspace)
+        run: cargo llvm-cov --workspace --locked --ignore-run-fail --lcov --output-path lcov.info
+      - name: Upload to Codecov (tokenless; never fails the build)
+        uses: codecov/codecov-action@v7
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: lcov.info
+          slug: GetBusbar/busbar-admin
+          fail_ci_if_error: false
