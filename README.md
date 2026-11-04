@@ -1,17 +1,16 @@
 # busbar-admin
 
+[![Coverage](https://codecov.io/gh/GetBusbar/busbar-admin/branch/dev/graph/badge.svg)](https://codecov.io/gh/GetBusbar/busbar-admin)
+
 A human-facing CLI for the [busbar](https://github.com/GetBusbar) gateway's **admin API**
 (`/api/v1/admin`). It speaks the frozen v1 contract over HTTP/HTTPS with a thin, hand-rolled
 client (no OpenAPI generator), so it's small and easy to extend.
 
-The contract it targets is committed at [`openapi.json`](openapi.json) (busbar **1.5.4**);
-CI compares that spec's version against the latest busbar release so drift is visible.
-
-Because the client is hand-rolled, a version match is not a shape match:
-[`tests/openapi_conformance.rs`](tests/openapi_conformance.rs) loads that same committed
-`openapi.json` and checks every request/response type in `src/client.rs` against its schema, field
-set, required/nullable-ness, and endpoint wiring. Renaming a Rust field, making a required field
-optional, or resyncing a spec that grew a property all fail `cargo test`.
+The contract it targets is committed at [`openapi.json`](openapi.json) (busbar **1.6.0**, the core version pinned in [`.busbar-core`](.busbar-core)). Drift is
+caught two ways: CI compares that spec's version against the latest busbar release, and a set of
+contract tests compares the client's own structs against the spec's schemas field by field — locally
+against the committed copy, and in CI against core's spec at the paired branch. The second check is
+the one that sees a shape change made under an unchanged version stamp.
 
 ## Install
 
@@ -35,11 +34,13 @@ Every global flag has an environment-variable fallback. Resolution order is
 | --------------- | --------------------- | -------------------------------------------------------------- |
 | `--endpoint`    | `BUSBAR_ENDPOINT`     | Gateway base URL, e.g. `http://localhost:8081`                 |
 | `--token`       | `BUSBAR_ADMIN_TOKEN`  | Admin token (sent as `x-admin-token` and `Authorization: Bearer`) |
+| `--token-file` | —                     | Read the admin token from a file (keeps it out of `ps` and shell history; `--token` on argv prints a warning) |
+| `--output-secret-to` | —               | `keys create` / `keys rotate`: write the minted credential (full JSON view, mode 0600) to this file or `/dev/fd/N` instead of stdout |
 | `--insecure`    | —                     | Skip TLS certificate verification (**dev only**)               |
 | `--ca-cert`     | —                     | Trust a private admin CA (PEM file)                            |
 | `--client-cert` | —                     | Client certificate (PEM) for mTLS (with `--client-key`)        |
 | `--client-key`  | —                     | Client private key (PEM) for mTLS (with `--client-cert`)       |
-| `--json`        | —                     | Emit raw JSON instead of the human table/summary               |
+| `--json`        | —                     | Emit the modeled JSON view instead of the human table/summary               |
 
 The TLS knobs mirror the busbar Terraform provider (`insecure`, `ca_cert_pem`,
 `client_cert_pem`/`client_key_pem`) so the same trust setup works for both.
@@ -61,7 +62,7 @@ busbar-admin info
 busbar 1.5.2
   uptime:           1m 12s
   config version:   0
-  config persist:   off (live-only)
+  config persist:   off (mutations locked)
   topology:         0 pools, 1 models, 1 providers
   auth modules:     tokens
   hook plugins:     (none)
@@ -135,7 +136,8 @@ disk** — the next reload/restart returns to disk truth.
 
 ### JSON output
 
-Add `--json` to any command to get the gateway's raw JSON for scripting:
+Add `--json` to any command to get its modeled JSON view for scripting. Unknown additive
+response fields are ignored by typed commands; `config show` preserves the gateway's JSON view:
 
 ```sh
 busbar-admin --json info | jq .version
@@ -149,7 +151,37 @@ busbar-admin turns the common failure modes into actionable messages:
 - connection refused → `no gateway reachable at <endpoint>`
 - `401` → `admin token rejected`
 - `403` → `admin token lacks the required scope`
-- any other gateway error carries the `{code, message}` envelope verbatim.
+- other gateway errors report their HTTP status; response bodies are withheld because they can contain credentials.
+
+## Credential handling and limits
+
+`--output-secret-to` is prepared before minting or rotating a key. Regular files are
+replaced atomically with a new private file, so existing readers cannot see the new
+credential. Symlinks and nonregular paths are refused; inherited `/dev/fd/N` sinks
+remain supported. A sibling `.NAME.busbar-lock` prevents simultaneous writers. If a
+process is killed, remove that lock only after confirming its recorded PID is no
+longer writing. A crash can also leave a private `.busbar-secret-PID-N` staging file.
+Output errors retain that private recovery file and report its location; failed writes
+can leave it incomplete, so verify it before using the credential.
+
+Responses and config inputs are limited to 32 MiB, plugin tarballs to 128 MiB,
+PEM inputs to 1 MiB each, and token files to 64 KiB. Endpoints must be HTTP(S)
+without userinfo, query strings or fragments. Tokens cannot contain control characters.
+Human output escapes terminal controls; JSON preserves values through JSON escaping.
+Application-owned credential and private-key buffers are wiped when released; HTTP
+and TLS library internals manage their own copies.
+
+## Differences from 1.5.5
+
+The key mint/rotate and admin response surfaces existed in core 1.5.5. The CLI now
+bounds hostile or mistaken inputs, treats key IDs as literal URL segments, withholds
+error bodies that might echo credentials, and escapes terminal controls. Credential
+files are prepared before a mutation and replaced privately, preventing the old
+open-after-rotation failure and disclosure through an existing public file. Valid
+credential values and successful command behavior are preserved.
+
+`config apply` also reports the newer `reload_to_apply` plane list when supplied by
+the gateway. This field was absent from the 1.5.5 full-config apply response.
 
 ## License
 

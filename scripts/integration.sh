@@ -1,10 +1,15 @@
 #!/usr/bin/env bash
-# End-to-end integration test: boot a REAL busbar gateway and drive EVERY busbar-admin command
-# against it, asserting real effects — the same "prove it works against a real busbar" bar the
-# plugin repos hold themselves to. Bidirectional by design:
-#   - busbar-admin's own CI runs this against the latest RELEASED busbar (catches CLIENT drift).
-#   - busbar core's dev-gate runs this against the FRESHLY-BUILT busbar (catches ENGINE drift that
-#     would break the admin client) — the reverse of how core tests each plugin.
+# End-to-end integration test: boot a REAL busbar gateway and exercise keys, read-only inspection,
+# and config apply, asserting real effects — the same "prove it works against a real busbar" bar the
+# plugin repos hold themselves to. Bidirectional by design, and driven against THREE engines:
+#   - busbar-admin's CI `integration` job: the PAIRED engine — core checked out at the SAME BRANCH
+#     as this run and built from source. This is the gate that blocks the release train; it proves
+#     "this client works with the engine it will ship beside".
+#   - busbar-admin's CI `integration-released` job: the last RELEASED busbar. Answers the different
+#     and equally real question "does the client work with the gateway users actually have today?".
+#     Non-blocking by design — it may legitimately go red mid-cycle.
+#   - busbar core's own qa-gate runs this against its FRESHLY-BUILT busbar (catches ENGINE drift
+#     that would break the admin client) — the reverse of how core tests each plugin.
 #
 # Usage: integration.sh <busbar-binary> <busbar-admin-binary>
 # Both must be executable. Uses ports 19080/19081 on localhost; override with BUSBAR_ITEST_PORT /
@@ -19,6 +24,22 @@ ADM=${2:?path to the busbar-admin binary}
 PORT=${BUSBAR_ITEST_PORT:-19080}
 ADMIN_PORT=${BUSBAR_ITEST_ADMIN_PORT:-19081}
 WORK=$(mktemp -d)
+BUSBAR_PID=
+cleanup() {
+  local ec=$?
+  trap - EXIT
+  if [ "$ec" -ne 0 ] && [ -f "$WORK/busbar.log" ]; then
+    echo "=== busbar log ===" >&2
+    cat "$WORK/busbar.log" >&2
+  fi
+  if [ -n "$BUSBAR_PID" ]; then
+    kill "$BUSBAR_PID" 2>/dev/null || true
+    wait "$BUSBAR_PID" 2>/dev/null || true
+  fi
+  rm -rf "$WORK"
+  exit "$ec"
+}
+trap cleanup EXIT
 export BUSBAR_ADMIN_TOKEN="itest-$$-$RANDOM"
 export MOCK_KEY="not-a-real-key"
 export BUSBAR_ENDPOINT="http://127.0.0.1:${ADMIN_PORT}"
@@ -29,36 +50,102 @@ cat > "$BUSBAR_PROVIDERS" <<EOF
 mock:
   protocol: anthropic
   base_url: "http://127.0.0.1:9"
-  api_key_env: MOCK_KEY
+  api_key: { env: MOCK_KEY }
 EOF
 # 1.5.1: the built-in `keys` verifier requires an explicit signing key — busbar no longer
 # auto-generates one. Mint a real ed25519 secret via the shipping command (secret -> stdout,
 # guidance -> stderr) into a file and reference it as a {file:} secret ref, as an operator would.
 "$BUSBAR_BIN" --generate-signing-key > "$WORK/signing.key" 2>/dev/null
 [ -s "$WORK/signing.key" ] || { echo "--generate-signing-key produced no key" >&2; exit 1; }
-cat > "$BUSBAR_CONFIG" <<EOF
-listen: "127.0.0.1:${PORT}"
-admin_listen: "127.0.0.1:${ADMIN_PORT}"
-# 1.5.3: inline module entries under `auth.admin_auth:` were retired. Each identity provider is
-# DEFINED once here and REFERENCED by bare name below; busbar refuses to boot the old inline shape.
-identity-providers:
-  admin-tokens: { module: admin-tokens, token: { env: BUSBAR_ADMIN_TOKEN } }
-auth:
-  chain: [keys]
-  signing_key: { file: "${WORK}/signing.key" }
-  admin_auth: [admin-tokens]
-providers:
-  mock:
-    api_key: { env: MOCK_KEY }
-models:
-  m:
-    provider: mock
-EOF
+# ── admin-auth config grammar: PROBED, never assumed ──────────────────────────────────────────
+# The admin-token provider is declared two incompatible ways depending on the engine:
+#   1.5.3+ : define once under top-level `identity-providers:`, reference by BARE NAME from
+#            `auth.admin_auth:`. The inline form is RETIRED and fail-closes at boot.
+#   ≤1.5.2 : the inline `auth.admin_auth: [- admin-tokens: {…}]` entry form. The top-level
+#            `identity-providers:` key does not exist and is rejected as an unknown field.
+# This script is run against BOTH (the paired same-branch engine and the last released one), so it
+# cannot hard-code either. `busbar --version` cannot discriminate — core `dev` carried the 1.5.3
+# grammar while still reporting `busbar 1.5.2` — so this is a real CAPABILITY probe: write the
+# modern form, ask the engine's own `--validate` (no server, no network, no state), and fall back
+# ONLY on the exact "unknown field `identity-providers`" rejection. Any other validation error is
+# a genuine failure and is surfaced as one.
+# From 1.6.0 the version IS the discriminator (see "Which grammar" below). The 1.6.0 operator
+# credential is still `token:` on the `admin-tokens` definition, but ONLY a distribution that links
+# the admin-tokens plugin knows that word: core's bare composition root (no plugins) reads the
+# operator words as empty and rejects `token:` as meaningless (BUSBAR-3015). So the 1.6.0 fixture
+# must be run against the default distribution (dist/default), which CI builds for core >= 1.6.0.
+write_config() { # $1 = grammar: v1.6.0 | modern (1.5.3-1.5.5) | legacy (<=1.5.2)
+  # JSON is also YAML. Keep the ORIGINAL operator document available for config apply: the
+  # redacted GET /config view is a topology projection, never a round-trippable deploy config.
+  python3 - "$1" "$WORK" "$PORT" "$ADMIN_PORT" "$BUSBAR_CONFIG" <<'PY'
+import json, pathlib, sys
+grammar, work, port, admin_port, target = sys.argv[1:]
+config = {
+    'listen': f'127.0.0.1:{port}',
+    'admin_listen': f'127.0.0.1:{admin_port}',
+    'auth': {'chain': ['keys'], 'signing_key': {'file': f'{work}/signing.key'}},
+    'providers': {'mock': {'api_key': {'env': 'MOCK_KEY'}}},
+    'models': {'m': {'provider': 'mock'}},
+}
+token = {'token': {'env': 'BUSBAR_ADMIN_TOKEN'}}
+if grammar == 'legacy':
+    config['auth']['admin_auth'] = [{'admin-tokens': token}]
+else:
+    config['identity-providers'] = {'admin-tokens': {'module': 'admin-tokens', **token}}
+    config['auth']['admin_auth'] = ['admin-tokens']
+    config['store'] = {'module': 'memory'}
+pathlib.Path(target).write_text(json.dumps(config))
+# A visible topology change proves the returned acknowledgement was actually installed.
+config['models']['apply-proof'] = {'provider': 'mock'}
+providers = {'mock': {'protocol': 'anthropic', 'base_url': 'http://127.0.0.1:9',
+                      **({'api_key': {'env': 'MOCK_KEY'}} if grammar == 'v1.6.0' else
+                         {'api_key_env': 'MOCK_KEY'})}}
+pathlib.Path(work, 'apply.json').write_text(json.dumps({'config': config, 'providers': providers}))
+PY
+}
+
+# ── Which grammar: picked from the core's REPORTED version ─────────────────────────────────────
+# `busbar --version` prints `busbar <semver>`. A core at or past 1.6.0 gets the 1.6.0 fixture and
+# it is held STRICT: `--validate` must accept it, with no fallback to an older grammar (a 1.6.0
+# core that rejects its own fixture is a real failure, never a vintage difference). An older core
+# gets the 1.5.x grammar, where the capability probe above still separates 1.5.3+ from <=1.5.2.
+CORE_VERSION=$("$BUSBAR_BIN" --version | awk '{print $2}')
+[ -n "$CORE_VERSION" ] || { echo "could not read a version from '$BUSBAR_BIN --version'" >&2; exit 1; }
+# `sort -V` puts the smaller of the two first; the core is >= 1.6.0 iff 1.6.0 sorts first (or ties).
+# A pre-release (1.6.0-dev.1) sorts BEFORE 1.6.0 under -V, so the pre-release suffix is cut first:
+# a 1.6.0 pre-release speaks the 1.6.0 grammar.
+CORE_BASE=${CORE_VERSION%%-*}
+if [ "$(printf '%s\n%s\n' 1.6.0 "$CORE_BASE" | sort -V | head -n1)" = 1.6.0 ]; then
+  GRAMMAR=v1.6.0
+  write_config v1.6.0
+  if ! "$BUSBAR_BIN" --validate > "$WORK/validate.log" 2>&1; then
+    echo "the 1.6.0 config fixture was rejected by busbar $CORE_VERSION --validate:" >&2
+    cat "$WORK/validate.log" >&2
+    exit 1
+  fi
+else
+  GRAMMAR=modern
+  write_config modern
+  if ! "$BUSBAR_BIN" --validate > "$WORK/validate.log" 2>&1; then
+    if grep -q 'unknown field `identity-providers`' "$WORK/validate.log"; then
+      GRAMMAR=legacy
+      write_config legacy
+      if ! "$BUSBAR_BIN" --validate > "$WORK/validate.log" 2>&1; then
+        echo "neither admin_auth grammar validates against this busbar:" >&2
+        cat "$WORK/validate.log" >&2
+        exit 1
+      fi
+    else
+      echo "config fixture rejected by busbar --validate (not a grammar-vintage difference):" >&2
+      cat "$WORK/validate.log" >&2
+      exit 1
+    fi
+  fi
+fi
+echo "admin_auth config grammar: $GRAMMAR ($("$BUSBAR_BIN" --version))"
 
 "$BUSBAR_BIN" > "$WORK/busbar.log" 2>&1 &
 BUSBAR_PID=$!
-cleanup() { kill "$BUSBAR_PID" 2>/dev/null || true; wait "$BUSBAR_PID" 2>/dev/null || true; }
-trap 'ec=$?; if [ $ec -ne 0 ]; then echo "=== busbar log ==="; cat "$WORK/busbar.log"; fi; cleanup; exit $ec' EXIT
 
 # Wait for the admin listener (a clean `info` is the readiness signal).
 ready=0
@@ -118,17 +205,36 @@ pass "plugins list (store/auth/hooks)"
 "$ADM" config show >/dev/null || fail "config show errored"
 pass "config version + show"
 
-# ── config apply round-trip: apply the running config back and require applied=true ────────────
+# ── config apply: submit operator input and prove the new generation is installed ──────────────
 # Exercises the mutating path AND the `applied` in-band success check (a 200/applied=false must be
 # a nonzero exit, never a silent "applied").
-CFG=$("$ADM" config show --json)
-python3 -c "import json,sys; c=json.load(sys.stdin); json.dump({'config':c,'providers':{'mock':{'protocol':'anthropic','base_url':'http://127.0.0.1:9','api_key_env':'MOCK_KEY'}}}, open('$WORK/apply.json','w'))" <<<"$CFG"
-if "$ADM" config apply "$WORK/apply.json" >/dev/null 2>"$WORK/apply.err"; then
-  pass "config apply (applied=true)"
-else
-  # A structural rejection of the re-applied config is the SERVER's contract, not a CLI bug; only
-  # fail the suite if the CLI itself misbehaved. Surface the message either way.
-  echo "  note: config apply round-trip rejected by the gateway (not a CLI defect): $(cat "$WORK/apply.err")"
+"$ADM" config version --json > "$WORK/version-before.json"
+"$ADM" config show --json > "$WORK/config-before.json"
+python3 - "$WORK/config-before.json" <<'PY'
+import json, sys
+assert all(m['model'] != 'apply-proof' for m in json.load(open(sys.argv[1]))['models'])
+PY
+if ! "$ADM" config apply "$WORK/apply.json" --json >"$WORK/applied.json" 2>"$WORK/apply.err"; then
+  cat "$WORK/apply.err" >&2
+  fail "config apply failed"
 fi
+"$ADM" config version --json > "$WORK/version-after.json"
+"$ADM" config show --json > "$WORK/config-after.json"
+python3 - "$WORK" <<'PY'
+import json, pathlib, sys
+root = pathlib.Path(sys.argv[1])
+def read(name):
+    return json.loads((root / name).read_text())
+before = read('version-before.json')['config_version']
+applied = read('applied.json')
+after = read('version-after.json')['config_version']
+config = read('config-after.json')
+assert applied['applied'] is True, 'config apply did not acknowledge applied=true'
+assert applied['config_version'] > before, 'config apply did not advance the generation'
+assert after == applied['config_version'] == config['version'], 'applied generation is not live'
+assert any(m['model'] == 'apply-proof' and m['provider'] == 'mock' for m in config['models']), \
+    'the applied model is absent from the running config'
+PY
+pass "config apply (applied=true, version advanced, model installed)"
 
-echo "INTEGRATION OK: every busbar-admin command drove a real busbar ${BUSBAR_BIN##*/} end to end"
+echo "INTEGRATION OK: keys, inspection, and config apply drove a real busbar ${BUSBAR_BIN##*/} end to end"

@@ -4,15 +4,53 @@
 //! busbar-admin — a human-facing CLI for the busbar gateway's admin API (`/api/v1/admin`).
 //!
 //! Config resolution is CLI flag > env var > a clear error. The thin admin client lives in
-//! `busbar_admin::client`; this module is the clap surface + human/JSON rendering.
+//! [`client`]; this module is the clap surface + human/JSON rendering.
+
+macro_rules! human_println {
+    ($($arg:tt)*) => { writeln!(&mut std::io::stdout().lock(), "{}", terminal_text(&format!($($arg)*)))? };
+}
+
+fn terminal_text(text: &str) -> String {
+    let mut output = String::with_capacity(text.len());
+    for c in text.chars() {
+        if c.is_control() {
+            output.extend(c.escape_default());
+        } else {
+            output.push(c);
+        }
+    }
+    output
+}
+
+mod client;
+
+use std::io::Write;
+use std::path::Path;
+use zeroize::{Zeroize, Zeroizing};
 
 use anyhow::{Context, Result};
-use clap::{Args, Parser, Subcommand};
+use clap::parser::ValueSource;
+use clap::{Args, CommandFactory, FromArgMatches, Parser, Subcommand};
 
-use busbar_admin::argmap::{parse_labels, resolve_allowed_pools};
-use busbar_admin::client::{
-    Client, CreateKeyReq, InspectPluginReq, InstallPluginReq, KeyView, PluginView, Tls,
+use client::{
+    Client, CreateKeyReq, CreatedKeyView, InspectPluginReq, InstallPluginReq, KeyView, PluginView,
+    RotatedKeyView, Tls,
 };
+
+/// Resolve the three distinct `allowed_pools` states the server understands: omitted (`None`) =
+/// ALL pools; an explicit empty list (`--no-pools`) = NO pools; a non-empty list = exactly those.
+/// A shared function so `cmd_keys_create` and its test exercise the SAME mapping — collapsing
+/// `--no-pools` into `None` would mint an all-pools key when no-pools was asked for (fail-open on
+/// privilege).
+fn resolve_allowed_pools(no_pools: bool, pools: &[String]) -> Option<Vec<String>> {
+    if no_pools {
+        Some(Vec::new())
+    } else if pools.is_empty() {
+        None
+    } else {
+        Some(pools.to_vec())
+    }
+}
 
 /// busbar-admin — talk to a busbar gateway's admin API.
 #[derive(Parser)]
@@ -40,6 +78,17 @@ struct GlobalOpts {
     )]
     token: Option<String>,
 
+    /// Read the admin token from this file (trailing newline ignored). Keeps the token out of
+    /// argv (`ps`, shell history); takes precedence over $BUSBAR_ADMIN_TOKEN.
+    #[arg(long, global = true, value_name = "PATH")]
+    token_file: Option<std::path::PathBuf>,
+
+    /// Write a minted or rotated credential (keys create / keys rotate) to this file (mode 0600)
+    /// instead of stdout, as the full JSON view. `/dev/fd/N` writes to an inherited descriptor.
+    /// Stdout then shows where the credential went in place of its value.
+    #[arg(long, global = true, value_name = "PATH")]
+    output_secret_to: Option<std::path::PathBuf>,
+
     /// Skip TLS certificate verification (DEV ONLY).
     #[arg(long, global = true)]
     insecure: bool,
@@ -56,9 +105,15 @@ struct GlobalOpts {
     #[arg(long, global = true, value_name = "PATH")]
     client_key: Option<std::path::PathBuf>,
 
-    /// Emit raw JSON instead of a human table/summary.
+    /// Emit the modeled JSON view instead of a human table/summary.
     #[arg(long, global = true)]
     json: bool,
+}
+
+impl Drop for GlobalOpts {
+    fn drop(&mut self) {
+        self.token.zeroize();
+    }
 }
 
 #[derive(Subcommand)]
@@ -193,22 +248,69 @@ enum ConfigCmd {
 
 fn main() {
     if let Err(e) = run() {
-        eprintln!("error: {e:#}");
+        let _ = writeln!(
+            &mut std::io::stderr().lock(),
+            "error: {}",
+            terminal_text(&format!("{e:#}"))
+        );
         std::process::exit(1);
     }
 }
 
+/// Warning printed (to stderr) when the admin token arrives on the command line.
+const ARGV_TOKEN_WARNING: &str = "warning: --token puts the admin token in the process list and \
+shell history; prefer --token-file or BUSBAR_ADMIN_TOKEN";
+
+/// Resolve the admin token: `--token-file` > `--token` / $BUSBAR_ADMIN_TOKEN. Returns the token
+/// and whether it came from argv (the caller warns). The token-file's contents never appear in an
+/// error.
+fn resolve_token(
+    token: Option<&str>,
+    source: Option<ValueSource>,
+    token_file: Option<&Path>,
+) -> Result<(Zeroizing<String>, bool)> {
+    let from_argv = source == Some(ValueSource::CommandLine);
+    if let Some(path) = token_file {
+        if from_argv {
+            anyhow::bail!("--token and --token-file are mutually exclusive");
+        }
+        let bytes = client::read_local(path, 64 * 1024, "--token-file")?;
+        let raw = std::str::from_utf8(&bytes).context("--token-file must be UTF-8")?;
+        let tok = raw.trim_end_matches(['\r', '\n']);
+        if tok.is_empty() {
+            anyhow::bail!("--token-file {} is empty", path.display());
+        }
+        return Ok((Zeroizing::new(tok.to_string()), false));
+    }
+    let tok = token.context("no admin token: pass --token or set BUSBAR_ADMIN_TOKEN")?;
+    Ok((Zeroizing::new(tok.to_string()), from_argv))
+}
+
+fn wipe_arg_tokens(matches: &mut clap::ArgMatches) {
+    if let Some(mut token) = matches.remove_one::<String>("token") {
+        token.zeroize();
+    }
+    if let Some((_, mut child)) = matches.remove_subcommand() {
+        wipe_arg_tokens(&mut child);
+    }
+}
+
 fn run() -> Result<()> {
-    let cli = Cli::parse();
+    let mut matches = Cli::command().get_matches();
+    let cli = Cli::from_arg_matches(&matches).unwrap_or_else(|e| e.exit());
+    let token_source = matches.value_source("token");
+    wipe_arg_tokens(&mut matches);
     let g = &cli.global;
 
     let endpoint = g.endpoint.clone().context(
         "no endpoint: pass --endpoint or set BUSBAR_ENDPOINT (e.g. http://localhost:8081)",
     )?;
-    let token = g
-        .token
-        .clone()
-        .context("no admin token: pass --token or set BUSBAR_ADMIN_TOKEN")?;
+    let (token, from_argv) =
+        resolve_token(g.token.as_deref(), token_source, g.token_file.as_deref())?;
+    if from_argv {
+        writeln!(&mut std::io::stderr().lock(), "{ARGV_TOKEN_WARNING}")?;
+    }
+    let secret_to = g.output_secret_to.as_deref();
 
     let tls = Tls {
         insecure: g.insecure,
@@ -223,9 +325,9 @@ fn run() -> Result<()> {
         Command::Info => cmd_info(&c, json),
         Command::Keys(k) => match k {
             KeysCmd::List => cmd_keys_list(&c, json),
-            KeysCmd::Create(a) => cmd_keys_create(&c, a, json),
+            KeysCmd::Create(a) => cmd_keys_create(&c, a, json, secret_to),
             KeysCmd::Get { id } => cmd_keys_get(&c, id, json),
-            KeysCmd::Rotate { id } => cmd_keys_rotate(&c, id, json),
+            KeysCmd::Rotate { id } => cmd_keys_rotate(&c, id, json, secret_to),
             KeysCmd::Revoke { id } => cmd_keys_revoke(&c, id, json),
             KeysCmd::Delete { id } => cmd_keys_delete(&c, id, json),
         },
@@ -251,7 +353,12 @@ fn run() -> Result<()> {
 }
 
 fn print_json<T: serde::Serialize>(v: &T) -> Result<()> {
-    println!("{}", serde_json::to_string_pretty(v)?);
+    write_json(v, &mut std::io::stdout().lock())
+}
+
+fn write_json<T: serde::Serialize>(v: &T, out: &mut dyn Write) -> Result<()> {
+    let text = Zeroizing::new(serde_json::to_string_pretty(v)?);
+    writeln!(out, "{}", text.as_str())?;
     Ok(())
 }
 
@@ -260,23 +367,25 @@ fn cmd_info(c: &Client, json: bool) -> Result<()> {
     if json {
         return print_json(&info);
     }
-    println!("busbar {}", info.version);
+    human_println!("busbar {}", info.version);
     match info.uptime_seconds {
-        Some(s) => println!("  uptime:           {}", human_duration(s)),
-        None => println!("  uptime:           (unknown)"),
+        Some(s) => human_println!("  uptime:           {}", human_duration(s)),
+        None => human_println!("  uptime:           (unknown)"),
     }
-    println!("  config version:   {}", info.config_version);
-    println!(
+    human_println!("  config version:   {}", info.config_version);
+    human_println!(
         "  config persist:   {}",
         if info.config_persistence {
             "on (durable)"
         } else {
-            "off (live-only)"
+            "off (mutations locked)"
         }
     );
-    println!(
+    human_println!(
         "  topology:         {} pools, {} models, {} providers",
-        info.topology.pools, info.topology.models, info.topology.providers
+        info.topology.pools,
+        info.topology.models,
+        info.topology.providers
     );
     let am = if info.build.auth_modules.is_empty() {
         "(none)".to_string()
@@ -288,9 +397,9 @@ fn cmd_info(c: &Client, json: bool) -> Result<()> {
     } else {
         info.build.hook_plugins.join(", ")
     };
-    println!("  auth modules:     {am}");
-    println!("  hook plugins:     {hp}");
-    println!("  weighted floor:   {}", info.build.weighted_floor);
+    human_println!("  auth modules:     {am}");
+    human_println!("  hook plugins:     {hp}");
+    human_println!("  weighted floor:   {}", info.build.weighted_floor);
     Ok(())
 }
 
@@ -300,15 +409,19 @@ fn cmd_keys_list(c: &Client, json: bool) -> Result<()> {
         return print_json(&page);
     }
     if page.items.is_empty() {
-        println!("no virtual keys");
+        human_println!("no virtual keys");
         return Ok(());
     }
-    println!(
+    human_println!(
         "{:<22} {:<20} {:<16} {:<10} {:<12} ENABLED",
-        "ID", "NAME", "GROUP", "STATE", "POOLS"
+        "ID",
+        "NAME",
+        "GROUP",
+        "STATE",
+        "POOLS"
     );
     for k in &page.items {
-        println!(
+        human_println!(
             "{:<22} {:<20} {:<16} {:<10} {:<12} {}",
             k.id,
             truncate(&k.name, 20),
@@ -319,9 +432,20 @@ fn cmd_keys_list(c: &Client, json: bool) -> Result<()> {
         );
     }
     if page.next_cursor.is_some() {
-        println!("(more keys available — showing the first page)");
+        human_println!("(more keys available — showing the first page)");
     }
     Ok(())
+}
+
+fn parse_labels(pairs: &[String]) -> Result<std::collections::BTreeMap<String, String>> {
+    pairs
+        .iter()
+        .map(|p| {
+            p.split_once('=')
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .ok_or_else(|| anyhow::anyhow!("--label must be KEY=VALUE, got {p:?}"))
+        })
+        .collect()
 }
 
 fn pools_summary(pools: &Option<Vec<String>>) -> String {
@@ -332,7 +456,12 @@ fn pools_summary(pools: &Option<Vec<String>>) -> String {
     }
 }
 
-fn cmd_keys_create(c: &Client, a: &KeyCreateArgs, json: bool) -> Result<()> {
+fn cmd_keys_create(
+    c: &Client,
+    a: &KeyCreateArgs,
+    json: bool,
+    secret_to: Option<&Path>,
+) -> Result<()> {
     let req = CreateKeyReq {
         name: a.name.clone(),
         // Three distinct states the server understands: omitted (None) = ALL pools;
@@ -347,32 +476,227 @@ fn cmd_keys_create(c: &Client, a: &KeyCreateArgs, json: bool) -> Result<()> {
         labels: parse_labels(&a.labels)?,
         issue_aws_credential: a.issue_aws_credential,
     };
+    let mut sink = secret_to.map(SecretSink::open).transpose()?;
     let created = c.create_key(&req)?;
-    if json {
-        return print_json(&created);
+    render_created(&created, json, sink.as_mut(), &mut std::io::stdout().lock())
+}
+
+/// The JSON object names that carry a once-shown credential in a mint or rotate view.
+const SECRET_FIELDS: [&str; 3] = ["token", "aws_secret_access_key", "secret"];
+
+/// A private destination prepared before a once-only credential is minted.
+struct SinkLock(std::path::PathBuf);
+
+impl Drop for SinkLock {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
     }
-    println!("created key {} ({})", created.id, created.name);
+}
+
+struct SecretSink {
+    path: std::path::PathBuf,
+    file: std::fs::File,
+    temporary: Option<std::path::PathBuf>,
+    _lock: Option<SinkLock>,
+}
+
+impl SecretSink {
+    fn open(path: &Path) -> Result<Self> {
+        let inherited = path
+            .strip_prefix("/dev/fd")
+            .ok()
+            .and_then(|p| p.to_str())
+            .is_some_and(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()));
+        if inherited {
+            let file = std::fs::OpenOptions::new()
+                .write(true)
+                .open(path)
+                .with_context(|| format!("opening --output-secret-to {}", path.display()))?;
+            return Ok(Self {
+                path: path.to_owned(),
+                file,
+                temporary: None,
+                _lock: None,
+            });
+        }
+        match std::fs::symlink_metadata(path) {
+            Ok(metadata) => anyhow::ensure!(
+                metadata.is_file(),
+                "--output-secret-to must be a regular file or /dev/fd/N"
+            ),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e).context("checking --output-secret-to"),
+        }
+        let parent = path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or(Path::new("."));
+        let name = path
+            .file_name()
+            .context("--output-secret-to requires a filename")?;
+        let mut lock_name = std::ffi::OsString::from(".");
+        lock_name.push(name);
+        lock_name.push(".busbar-lock");
+        let lock_path = parent.join(lock_name);
+        let mut lock_options = std::fs::OpenOptions::new();
+        lock_options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            lock_options.mode(0o600);
+        }
+        let mut lock_file = lock_options.open(&lock_path).with_context(|| {
+            format!(
+                "locking --output-secret-to {}; another writer or stale lock may exist",
+                path.display()
+            )
+        })?;
+        let lock = SinkLock(lock_path);
+        writeln!(lock_file, "{}", std::process::id()).context("recording credential writer")?;
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        for _ in 0..128 {
+            let serial = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let temporary = parent.join(format!(".busbar-secret-{}-{serial}", std::process::id()));
+            let mut options = std::fs::OpenOptions::new();
+            options.write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt as _;
+                options.mode(0o600);
+            }
+            match options.open(&temporary) {
+                Ok(file) => {
+                    return Ok(Self {
+                        path: path.to_owned(),
+                        file,
+                        temporary: Some(temporary),
+                        _lock: Some(lock),
+                    })
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(e) => return Err(e).context("preparing --output-secret-to"),
+            }
+        }
+        anyhow::bail!("cannot allocate a private --output-secret-to file")
+    }
+
+    fn write<T: serde::Serialize>(&mut self, view: &T) -> Result<()> {
+        let temporary = self.temporary.take();
+        let result = (|| -> Result<()> {
+            serde_json::to_writer_pretty(&mut self.file, view)
+                .context("writing credential JSON")?;
+            self.file
+                .write_all(b"\n")
+                .context("writing credential newline")?;
+            self.file.flush().context("flushing credential output")?;
+            if let Some(temporary) = &temporary {
+                self.file.sync_all().context("syncing credential output")?;
+                std::fs::rename(temporary, &self.path).context("publishing --output-secret-to")?;
+            }
+            Ok(())
+        })();
+        match temporary {
+            Some(path) => result.with_context(|| format!("credential output failed; private recovery file retained at {} (it may be incomplete)", path.display())),
+            None => result,
+        }
+    }
+}
+
+impl Drop for SecretSink {
+    fn drop(&mut self) {
+        if let Some(temporary) = &self.temporary {
+            let _ = std::fs::remove_file(temporary);
+        }
+    }
+}
+
+fn wipe_json(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::String(s) => s.zeroize(),
+        serde_json::Value::Array(values) => values.iter_mut().for_each(wipe_json),
+        serde_json::Value::Object(values) => values.values_mut().for_each(wipe_json),
+        _ => {}
+    }
+}
+
+/// The `--json` rendering with the credential fields dropped (they went to the secret sink).
+fn json_without_secrets<T: serde::Serialize>(view: &T) -> Result<serde_json::Value> {
+    let mut v = serde_json::to_value(view)?;
+    if let Some(o) = v.as_object_mut() {
+        for k in SECRET_FIELDS {
+            if let Some(mut value) = o.remove(k) {
+                wipe_json(&mut value);
+            }
+        }
+    }
+    Ok(v)
+}
+
+fn render_created(
+    created: &CreatedKeyView,
+    json: bool,
+    mut secret_to: Option<&mut SecretSink>,
+    out: &mut dyn Write,
+) -> Result<()> {
+    if let Some(p) = secret_to.as_mut() {
+        p.write(created)?;
+    }
+    if json {
+        let text = Zeroizing::new(match secret_to.as_ref() {
+            None => serde_json::to_string_pretty(created)?,
+            Some(_) => serde_json::to_string_pretty(&json_without_secrets(created)?)?,
+        });
+        writeln!(out, "{}", text.as_str())?;
+        return Ok(());
+    }
+    let shown = |v: &str| {
+        Zeroizing::new(match secret_to.as_ref() {
+            None => terminal_text(v),
+            Some(p) => terminal_text(&format!("(written to {})", p.path.display())),
+        })
+    };
+    writeln!(
+        out,
+        "created key {} ({})",
+        terminal_text(&created.id),
+        terminal_text(&created.name)
+    )?;
     if let Some(g) = &created.group {
-        println!(
-            "  group: {g}{}",
+        writeln!(
+            out,
+            "  group: {}{}",
+            terminal_text(g),
             if created.group_provisioned {
                 "  (auto-provisioned)"
             } else {
                 ""
             }
-        );
+        )?;
     }
-    println!("  expires_at: {} (unix seconds)", created.expires_at);
-    println!();
-    println!("  ┌─────────────────────────────────────────────────────────────┐");
-    println!("  │  TOKEN (shown once — store it now, it cannot be retrieved)  │");
-    println!("  └─────────────────────────────────────────────────────────────┘");
-    println!("  token: {}", created.token);
+    writeln!(out, "  expires_at: {} (unix seconds)", created.expires_at)?;
+    writeln!(out)?;
+    writeln!(
+        out,
+        "  ┌─────────────────────────────────────────────────────────────┐"
+    )?;
+    writeln!(
+        out,
+        "  │  TOKEN (shown once — store it now, it cannot be retrieved)  │"
+    )?;
+    writeln!(
+        out,
+        "  └─────────────────────────────────────────────────────────────┘"
+    )?;
+    writeln!(out, "  token: {}", shown(created.token.expose()).as_str())?;
     if let Some(id) = &created.aws_access_key_id {
-        println!("  aws_access_key_id:     {id}");
+        writeln!(out, "  aws_access_key_id:     {}", terminal_text(id))?;
     }
     if let Some(sk) = &created.aws_secret_access_key {
-        println!("  aws_secret_access_key: {sk}  (shown once)");
+        writeln!(
+            out,
+            "  aws_secret_access_key: {}  (shown once)",
+            shown(sk.expose()).as_str()
+        )?;
     }
     Ok(())
 }
@@ -382,14 +706,14 @@ fn cmd_keys_get(c: &Client, id: &str, json: bool) -> Result<()> {
     if json {
         return print_json(&k);
     }
-    println!("key {} ({})", k.id, k.name);
-    println!(
+    human_println!("key {} ({})", k.id, k.name);
+    human_println!(
         "  state:      {}",
         if k.state.is_empty() { "-" } else { &k.state }
     );
-    println!("  enabled:    {}", k.enabled);
-    println!("  group:      {}", k.group.as_deref().unwrap_or("(none)"));
-    println!(
+    human_println!("  enabled:    {}", k.enabled);
+    human_println!("  group:      {}", k.group.as_deref().unwrap_or("(none)"));
+    human_println!(
         "  pools:      {}",
         match &k.allowed_pools {
             None => "(all)".to_string(),
@@ -397,32 +721,70 @@ fn cmd_keys_get(c: &Client, id: &str, json: bool) -> Result<()> {
             Some(p) => p.join(", "),
         }
     );
-    println!("  created_at: {}", k.created_at);
+    human_println!("  created_at: {}", k.created_at);
     if !k.labels.is_empty() {
         let labels: Vec<String> = k.labels.iter().map(|(k, v)| format!("{k}={v}")).collect();
-        println!("  labels:     {}", labels.join(", "));
+        human_println!("  labels:     {}", labels.join(", "));
     }
     Ok(())
 }
 
-fn cmd_keys_rotate(c: &Client, id: &str, json: bool) -> Result<()> {
+fn cmd_keys_rotate(c: &Client, id: &str, json: bool, secret_to: Option<&Path>) -> Result<()> {
+    let mut sink = secret_to.map(SecretSink::open).transpose()?;
     let rotated = c.rotate_key(id)?;
-    if json {
-        return print_json(&rotated);
+    render_rotated(&rotated, json, sink.as_mut(), &mut std::io::stdout().lock())
+}
+
+fn render_rotated(
+    rotated: &RotatedKeyView,
+    json: bool,
+    mut secret_to: Option<&mut SecretSink>,
+    out: &mut dyn Write,
+) -> Result<()> {
+    if let Some(p) = secret_to.as_mut() {
+        p.write(rotated)?;
     }
-    println!("rotated key {} ({})", rotated.id, rotated.name);
-    println!();
-    println!("  ┌─────────────────────────────────────────────────────────────────┐");
-    println!("  │  NEW CREDENTIAL (shown once — the old one no longer resolves)  │");
-    println!("  └─────────────────────────────────────────────────────────────────┘");
+    if json {
+        let text = Zeroizing::new(match secret_to.as_ref() {
+            None => serde_json::to_string_pretty(rotated)?,
+            Some(_) => serde_json::to_string_pretty(&json_without_secrets(rotated)?)?,
+        });
+        writeln!(out, "{}", text.as_str())?;
+        return Ok(());
+    }
+    let shown = |v: &str| {
+        Zeroizing::new(match secret_to.as_ref() {
+            None => terminal_text(v),
+            Some(p) => terminal_text(&format!("(written to {})", p.path.display())),
+        })
+    };
+    writeln!(
+        out,
+        "rotated key {} ({})",
+        terminal_text(&rotated.id),
+        terminal_text(&rotated.name)
+    )?;
+    writeln!(out)?;
+    writeln!(
+        out,
+        "  ┌─────────────────────────────────────────────────────────────────┐"
+    )?;
+    writeln!(
+        out,
+        "  │  NEW CREDENTIAL (shown once — the old one no longer resolves)  │"
+    )?;
+    writeln!(
+        out,
+        "  └─────────────────────────────────────────────────────────────────┘"
+    )?;
     if let Some(t) = &rotated.token {
-        println!("  token: {t}");
+        writeln!(out, "  token: {}", shown(t.expose()).as_str())?;
         if let Some(exp) = rotated.expires_at {
-            println!("  expires_at: {exp} (unix seconds)");
+            writeln!(out, "  expires_at: {exp} (unix seconds)")?;
         }
     }
     if let Some(s) = &rotated.secret {
-        println!("  secret: {s}");
+        writeln!(out, "  secret: {}", shown(s.expose()).as_str())?;
     }
     Ok(())
 }
@@ -432,7 +794,7 @@ fn cmd_keys_revoke(c: &Client, id: &str, json: bool) -> Result<()> {
     if json {
         return print_json(&v);
     }
-    println!(
+    human_println!(
         "revoked key {} (denylisted; the record remains for audit)",
         v.revoked
     );
@@ -444,7 +806,7 @@ fn cmd_keys_delete(c: &Client, id: &str, json: bool) -> Result<()> {
     if json {
         return print_json(&serde_json::json!({"deleted": id}));
     }
-    println!("deleted key {id} (revoked and tombstoned)");
+    human_println!("deleted key {id} (revoked and tombstoned)");
     Ok(())
 }
 
@@ -454,23 +816,28 @@ fn cmd_plugins_list(c: &Client, plugin_type: &str, json: bool) -> Result<()> {
         return print_json(&page);
     }
     if page.items.is_empty() {
-        println!("no {plugin_type} plugins");
+        human_println!("no {plugin_type} plugins");
         return Ok(());
     }
-    print_plugin_rows(&page.items);
+    print_plugin_rows(&page.items)?;
     if page.next_cursor.is_some() {
-        println!("(more {plugin_type} plugins available — showing the first page)");
+        human_println!("(more {plugin_type} plugins available — showing the first page)");
     }
     Ok(())
 }
 
-fn print_plugin_rows(items: &[PluginView]) {
-    println!(
+fn print_plugin_rows(items: &[PluginView]) -> Result<()> {
+    human_println!(
         "{:<20} {:<7} {:<12} {:<8} {:<10} {:<10} FILE",
-        "NAME", "TYPE", "LOADER", "ACTIVE", "VERSION", "TRUST"
+        "NAME",
+        "TYPE",
+        "LOADER",
+        "ACTIVE",
+        "VERSION",
+        "TRUST"
     );
     for p in items {
-        println!(
+        human_println!(
             "{:<20} {:<7} {:<12} {:<8} {:<10} {:<10} {}",
             truncate(&p.name, 20),
             p.plugin_type,
@@ -481,6 +848,7 @@ fn print_plugin_rows(items: &[PluginView]) {
             p.file.as_deref().unwrap_or("-"),
         );
     }
+    Ok(())
 }
 
 fn cmd_plugins_install(
@@ -490,8 +858,7 @@ fn cmd_plugins_install(
     json: bool,
 ) -> Result<()> {
     use base64::Engine as _;
-    let bytes = std::fs::read(tarball)
-        .with_context(|| format!("reading plugin tarball {}", tarball.display()))?;
+    let bytes = client::read_local(tarball, 128 * 1024 * 1024, "plugin tarball")?;
     let file = match file {
         Some(f) => f.to_string(),
         None => tarball
@@ -508,7 +875,7 @@ fn cmd_plugins_install(
     if json {
         return print_json(&installed);
     }
-    println!(
+    human_println!(
         "installed {} (plugin {} v{}, trust: {})",
         installed.file,
         installed.name,
@@ -516,7 +883,7 @@ fn cmd_plugins_install(
         installed.trust,
     );
     if !installed.note.is_empty() {
-        println!("note: {}", installed.note);
+        human_println!("note: {}", installed.note);
     }
     Ok(())
 }
@@ -528,8 +895,7 @@ fn cmd_plugins_inspect(
     json: bool,
 ) -> Result<()> {
     use base64::Engine as _;
-    let bytes = std::fs::read(tarball)
-        .with_context(|| format!("reading plugin tarball {}", tarball.display()))?;
+    let bytes = client::read_local(tarball, 128 * 1024 * 1024, "plugin tarball")?;
     let file = match file {
         Some(f) => f.to_string(),
         None => tarball
@@ -546,18 +912,18 @@ fn cmd_plugins_inspect(
     if json {
         return print_json(&preview);
     }
-    println!(
+    human_println!(
         "plugin {} v{} (kind: {}, trust: {})",
         preview.name,
         preview.version.as_deref().unwrap_or("?"),
         preview.kind.as_deref().unwrap_or("-"),
         preview.trust,
     );
-    println!(
+    human_println!(
         "  restart required (default): {}",
         opt(preview.restart_required_default)
     );
-    println!(
+    human_println!(
         "  settings schema: {}",
         if preview.schema.is_some() {
             "present"
@@ -566,9 +932,9 @@ fn cmd_plugins_inspect(
         }
     );
     if let Some(err) = &preview.schema_error {
-        println!("  schema error: {err}");
+        human_println!("  schema error: {err}");
     }
-    println!("(preview only — nothing was installed)");
+    human_println!("(preview only — nothing was installed)");
     Ok(())
 }
 
@@ -578,12 +944,12 @@ fn cmd_plugins_reload(c: &Client, json: bool) -> Result<()> {
         return print_json(&v);
     }
     if v.plugins.is_empty() {
-        println!("no dynamic-library plugins in the plugins directory");
+        human_println!("no dynamic-library plugins in the plugins directory");
     } else {
-        print_plugin_rows(&v.plugins);
+        print_plugin_rows(&v.plugins)?;
     }
     if !v.note.is_empty() {
-        println!("note: {}", v.note);
+        human_println!("note: {}", v.note);
     }
     Ok(())
 }
@@ -594,15 +960,19 @@ fn cmd_hooks_list(c: &Client, json: bool) -> Result<()> {
         return print_json(&page);
     }
     if page.items.is_empty() {
-        println!("no hooks registered");
+        human_println!("no hooks registered");
         return Ok(());
     }
-    println!(
+    human_println!(
         "{:<20} {:<6} {:<8} {:<8} {:<7} TARGET",
-        "NAME", "KIND", "TRANSPORT", "PROMPT", "GLOBAL"
+        "NAME",
+        "KIND",
+        "TRANSPORT",
+        "PROMPT",
+        "GLOBAL"
     );
     for h in &page.items {
-        println!(
+        human_println!(
             "{:<20} {:<6} {:<8} {:<8} {:<7} {}",
             truncate(&h.name, 20),
             h.kind,
@@ -613,7 +983,7 @@ fn cmd_hooks_list(c: &Client, json: bool) -> Result<()> {
         );
     }
     if page.next_cursor.is_some() {
-        println!("(more hooks available — showing the first page)");
+        human_println!("(more hooks available — showing the first page)");
     }
     Ok(())
 }
@@ -627,13 +997,13 @@ fn cmd_config_version(c: &Client, json: bool) -> Result<()> {
             "config_persistence": info.config_persistence,
         }));
     }
-    println!("config version: {}", info.config_version);
-    println!(
+    human_println!("config version: {}", info.config_version);
+    human_println!(
         "persistence:    {}",
         if info.config_persistence {
             "on (durable across restart)"
         } else {
-            "off (live-only)"
+            "off (mutations locked)"
         }
     );
     Ok(())
@@ -649,11 +1019,12 @@ fn cmd_config_show(c: &Client, json: bool) -> Result<()> {
 }
 
 fn cmd_config_apply(c: &Client, file: &std::path::Path, json: bool) -> Result<()> {
-    let raw = std::fs::read_to_string(file)
-        .with_context(|| format!("reading config file {}", file.display()))?;
-    let body: serde_json::Value = serde_json::from_str(&raw)
+    let raw = client::read_local(file, 32 * 1024 * 1024, "config file")?;
+    let mut body: serde_json::Value = serde_json::from_slice(&raw)
         .with_context(|| format!("parsing {} as JSON", file.display()))?;
-    let resp = c.config_apply(&body)?;
+    let result = c.config_apply(&body);
+    wipe_json(&mut body);
+    let resp = result?;
     if json {
         print_json(&resp)?;
     }
@@ -671,9 +1042,15 @@ fn cmd_config_apply(c: &Client, file: &std::path::Path, json: bool) -> Result<()
         );
     }
     if !json {
-        println!("config applied — now at version {}", resp.config_version);
+        human_println!("config applied — now at version {}", resp.config_version);
+        if !resp.reload_to_apply.is_empty() {
+            human_println!(
+                "restart required to apply: {}",
+                resp.reload_to_apply.join(", ")
+            );
+        }
         if !resp.note.is_empty() {
-            println!("note: {}", resp.note);
+            human_println!("note: {}", resp.note);
         }
     }
     Ok(())
@@ -712,3 +1089,7 @@ fn human_duration(secs: u64) -> String {
     parts.push(format!("{s}s"));
     parts.join(" ")
 }
+
+#[cfg(test)]
+#[path = "cli_logic_tests.rs"]
+mod cli_logic_tests;

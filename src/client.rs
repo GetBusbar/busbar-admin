@@ -2,13 +2,18 @@
 //!
 //! The request/response structs below mirror the frozen v1 contract
 //! (`crates/busbar/src/admin/v1/contract`; the committed `openapi.json` at the repo root is the
-//! canonical spec this client was audited against — busbar 1.5.2). Only the fields busbar-admin actually renders are
+//! canonical spec this client is audited against, refreshed from core's generated document). The
+//! audit is not a one-off: `spec_contract_tests` below re-runs it on every `cargo test`, against
+//! the committed spec locally and against core's PAIRED spec in CI, so a shape change made under
+//! an unchanged version stamp cannot pass unnoticed. Only the fields busbar-admin renders are
 //! modelled; unknown fields are ignored (the contract is additive-only), so a newer gateway never
 //! breaks an older CLI. To add an endpoint: add a typed response struct and a method on
 //! [`Client`] that calls [`Client::get`] / [`Client::send`] with the relative path — every method
 //! funnels through those two seams for uniform auth, TLS, and error mapping.
 
+use std::io::Read as _;
 use std::time::Duration;
+use zeroize::{Zeroize, Zeroizing};
 
 use anyhow::{anyhow, Context, Result};
 use reqwest::blocking::{Client as HttpClient, RequestBuilder, Response};
@@ -16,6 +21,24 @@ use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION};
 use reqwest::{Method, StatusCode};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
+
+pub(crate) fn read_local(
+    path: &std::path::Path,
+    limit: u64,
+    label: &str,
+) -> Result<Zeroizing<Vec<u8>>> {
+    let file =
+        std::fs::File::open(path).with_context(|| format!("opening {label} {}", path.display()))?;
+    let mut bytes = Zeroizing::new(Vec::new());
+    file.take(limit + 1)
+        .read_to_end(&mut bytes)
+        .with_context(|| format!("reading {label}"))?;
+    anyhow::ensure!(
+        bytes.len() as u64 <= limit,
+        "{label} exceeds its {limit}-byte limit"
+    );
+    Ok(bytes)
+}
 
 /// Header the admin plane authenticates on (the API also accepts `Authorization: Bearer <token>`).
 const X_ADMIN_TOKEN: &str = "x-admin-token";
@@ -42,7 +65,22 @@ impl Client {
     /// Build a client. `endpoint` is the gateway base (e.g. `http://localhost:8081`); `token` is
     /// the admin token sent as `x-admin-token`. TLS knobs mirror the Terraform provider.
     pub fn new(endpoint: &str, token: &str, tls: Tls) -> Result<Self> {
-        let endpoint = endpoint.trim_end_matches('/').to_string();
+        let parsed = reqwest::Url::parse(endpoint)
+            .map_err(|_| anyhow!("endpoint must be a valid HTTP(S) URL"))?;
+        anyhow::ensure!(
+            matches!(parsed.scheme(), "http" | "https")
+                && parsed.host_str().is_some()
+                && parsed.username().is_empty()
+                && parsed.password().is_none()
+                && parsed.query().is_none()
+                && parsed.fragment().is_none(),
+            "endpoint must be HTTP(S), without userinfo, query or fragment"
+        );
+        anyhow::ensure!(
+            !token.is_empty() && !token.chars().any(char::is_control),
+            "admin token must be nonempty and contain no control characters"
+        );
+        let endpoint = parsed.as_str().trim_end_matches('/').to_string();
         let base = format!("{endpoint}{ADMIN_PREFIX}");
 
         let mut headers = HeaderMap::new();
@@ -51,7 +89,7 @@ impl Client {
         tok.set_sensitive(true);
         headers.insert(X_ADMIN_TOKEN, tok.clone());
         // Send both carriers; the gateway accepts either.
-        let mut bearer = HeaderValue::from_str(&format!("Bearer {token}"))
+        let mut bearer = HeaderValue::from_str(&Zeroizing::new(format!("Bearer {token}")))
             .context("admin token contains characters invalid for an HTTP header")?;
         bearer.set_sensitive(true);
         headers.insert(AUTHORIZATION, bearer);
@@ -70,20 +108,17 @@ impl Client {
             builder = builder.danger_accept_invalid_certs(true);
         }
         if let Some(ca) = &tls.ca_cert {
-            let pem =
-                std::fs::read(ca).with_context(|| format!("reading --ca-cert {}", ca.display()))?;
+            let pem = read_local(ca, 1024 * 1024, "--ca-cert")?;
             let cert = reqwest::Certificate::from_pem(&pem)
                 .with_context(|| format!("parsing --ca-cert {} as PEM", ca.display()))?;
             builder = builder.add_root_certificate(cert);
         }
         match (&tls.client_cert, &tls.client_key) {
             (Some(cert), Some(key)) => {
-                let mut pem = std::fs::read(cert)
-                    .with_context(|| format!("reading --client-cert {}", cert.display()))?;
-                let mut keypem = std::fs::read(key)
-                    .with_context(|| format!("reading --client-key {}", key.display()))?;
+                let mut pem = read_local(cert, 1024 * 1024, "--client-cert")?;
+                let keypem = read_local(key, 1024 * 1024, "--client-key")?;
                 pem.push(b'\n');
-                pem.append(&mut keypem);
+                pem.extend_from_slice(&keypem);
                 let identity = reqwest::Identity::from_pem(&pem)
                     .context("parsing --client-cert / --client-key as a PEM identity")?;
                 builder = builder.identity(identity);
@@ -116,6 +151,7 @@ impl Client {
 
     /// Turn a reqwest transport error into an actionable message (connection refused, DNS, TLS…).
     fn transport_error(&self, e: reqwest::Error) -> anyhow::Error {
+        let e = e.without_url();
         if e.is_connect() {
             return anyhow!(
                 "no gateway reachable at {} (connection failed): {e}",
@@ -128,35 +164,16 @@ impl Client {
         anyhow!("request to {} failed: {e}", self.endpoint)
     }
 
-    /// Map an HTTP status onto an error carrying the gateway's `{"error":{"code","message"}}`
-    /// envelope when present. 401/403 get dedicated hints.
+    /// Report HTTP status without echoing untrusted response bodies; 401/403 get dedicated hints.
     fn check_status(&self, resp: Response) -> Result<Response> {
         let status = resp.status();
         if status.is_success() {
             return Ok(resp);
         }
-        let body = resp.text().unwrap_or_default();
-        let envelope: Option<ErrorEnvelope> = serde_json::from_str(&body).ok();
-        let detail = envelope
-            .as_ref()
-            .map(|e| format!("{}: {}", e.error.code, e.error.message));
-
         let msg = match status {
-            StatusCode::UNAUTHORIZED => format!(
-                "admin token rejected ({}){}",
-                status,
-                detail.map(|d| format!(" — {d}")).unwrap_or_default()
-            ),
-            StatusCode::FORBIDDEN => format!(
-                "admin token lacks the required scope ({}){}",
-                status,
-                detail.map(|d| format!(" — {d}")).unwrap_or_default()
-            ),
-            _ => match detail {
-                Some(d) => format!("gateway returned {status}: {d}"),
-                None if body.is_empty() => format!("gateway returned {status}"),
-                None => format!("gateway returned {status}: {body}"),
-            },
+            StatusCode::UNAUTHORIZED => format!("admin token rejected ({status})"),
+            StatusCode::FORBIDDEN => format!("admin token lacks the required scope ({status})"),
+            _ => format!("gateway returned {status}; response body withheld because it may contain credentials"),
         };
         Err(anyhow!(msg))
     }
@@ -195,10 +212,44 @@ impl Client {
         Ok(())
     }
 
+    /// Decode a JSON body. The error NEVER carries the body or serde's own message: a mint or
+    /// rotate body holds a once-shown credential, and serde quotes the offending value
+    /// (`invalid type: string "…"`). Only the error class, its position and the body length are
+    /// reported, which is enough to diagnose a version skew without printing a secret.
     fn decode<T: DeserializeOwned>(resp: Response) -> Result<T> {
-        let body = resp.text().context("reading the response body")?;
-        serde_json::from_str(&body)
-            .with_context(|| format!("decoding the gateway response: {body}"))
+        let body = Self::read_body(resp)?;
+        serde_json::from_slice(&body).map_err(|e| {
+            let class = match e.classify() {
+                serde_json::error::Category::Io => "an I/O error",
+                serde_json::error::Category::Syntax => "invalid JSON",
+                serde_json::error::Category::Data => "an unexpected shape",
+                serde_json::error::Category::Eof => "a truncated body",
+            };
+            anyhow!(
+                "decoding the gateway response: {class} at line {} column {} ({} bytes; the body \
+                 is withheld because it may carry a credential)",
+                e.line(),
+                e.column(),
+                body.len()
+            )
+        })
+    }
+
+    fn read_body(resp: Response) -> Result<Zeroizing<Vec<u8>>> {
+        const LIMIT: u64 = 32 * 1024 * 1024;
+        anyhow::ensure!(
+            resp.content_length().is_none_or(|n| n <= LIMIT),
+            "gateway response exceeds the 32 MiB limit"
+        );
+        let mut body = Zeroizing::new(Vec::new());
+        resp.take(LIMIT + 1)
+            .read_to_end(&mut body)
+            .map_err(|_| anyhow!("reading the gateway response body failed"))?;
+        anyhow::ensure!(
+            body.len() as u64 <= LIMIT,
+            "gateway response exceeds the 32 MiB limit"
+        );
+        Ok(body)
     }
 
     // ── Typed endpoint methods ───────────────────────────────────────────────────────────────
@@ -218,32 +269,50 @@ impl Client {
         self.send(Method::POST, "/keys", Some(req))
     }
 
+    fn key_path(id: &str, suffix: &str) -> Result<String> {
+        anyhow::ensure!(
+            !id.is_empty() && !matches!(id, "." | ".."),
+            "key id must be a nonempty identifier, not a dot path segment"
+        );
+        let mut url = reqwest::Url::parse("http://localhost/keys/")?;
+        url.path_segments_mut()
+            .map_err(|_| anyhow!("cannot construct key path"))?
+            .pop_if_empty()
+            .push(id);
+        Ok(format!("{}{suffix}", url.path()))
+    }
+
     /// `GET /api/v1/admin/keys/{id}` — one key's metadata (never the secret).
     pub fn get_key(&self, id: &str) -> Result<KeyView> {
-        self.get(&format!("/keys/{id}"))
+        self.get(&Self::key_path(id, "")?)
     }
 
     /// `POST /api/v1/admin/keys/{id}/revoke` — durably denylist a key WITHOUT deleting the
     /// binding (the record stays visible for audit/usage attribution). Idempotent.
     pub fn revoke_key(&self, id: &str) -> Result<RevokeView> {
-        self.send(Method::POST, &format!("/keys/{id}/revoke"), None::<&()>)
+        self.send(Method::POST, &Self::key_path(id, "/revoke")?, None::<&()>)
     }
 
     /// `POST /api/v1/admin/keys/{id}/rotate` — mint a fresh credential in place (same id,
     /// budgets, usage). The new token/secret is shown once.
     pub fn rotate_key(&self, id: &str) -> Result<RotatedKeyView> {
-        self.send(Method::POST, &format!("/keys/{id}/rotate"), None::<&()>)
+        self.send(Method::POST, &Self::key_path(id, "/rotate")?, None::<&()>)
     }
 
     /// `DELETE /api/v1/admin/keys/{id}` — revoke AND forget (tombstone) a key (204).
     pub fn delete_key(&self, id: &str) -> Result<()> {
-        self.send_no_content(Method::DELETE, &format!("/keys/{id}"))
+        self.send_no_content(Method::DELETE, &Self::key_path(id, "")?)
     }
 
     /// `GET /api/v1/admin/plugins?type=` — the plugin catalog for one plugin type
     /// (`auth` | `hooks` | `store`).
     pub fn list_plugins(&self, plugin_type: &str) -> Result<PluginPage> {
-        self.get(&format!("/plugins?type={plugin_type}"))
+        let resp = self.execute(
+            self.http
+                .get(self.url("/plugins"))
+                .query(&[("type", plugin_type)]),
+        )?;
+        Self::decode(resp)
     }
 
     /// `POST /api/v1/admin/plugins` — install a signed plugin tarball (bytes ride as base64;
@@ -289,6 +358,8 @@ impl Client {
 #[derive(Debug, Deserialize, Serialize)]
 pub struct ConfigApplyView {
     pub applied: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reload_to_apply: Vec<String>,
     #[serde(default)]
     pub config_version: u64,
     #[serde(default)]
@@ -297,19 +368,37 @@ pub struct ConfigApplyView {
 
 // ── Contract-mirroring request/response types ────────────────────────────────────────────────
 
-/// The gateway's error envelope (`Error` in the spec): `{"error":{"code","message"}}`. Public so
-/// the conformance tests can assert the decoded shape against the committed schema; the CLI itself
-/// only renders `code`/`message` into a message.
-#[derive(Debug, Deserialize, Serialize)]
-pub struct ErrorEnvelope {
-    pub error: ErrorDetail,
+/// A once-shown credential the gateway minted (a signed token, an AWS secret, a legacy secret).
+///
+/// It (de)serializes as the bare string, so `--json` output stays byte-identical, but its `Debug`
+/// prints `<redacted>` and it has no `Display`: rendering it takes an explicit [`Secret::expose`].
+#[derive(Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(transparent)]
+pub struct Secret(String);
+
+impl Secret {
+    /// The credential itself. Every call site is a deliberate print or write of the secret.
+    pub fn expose(&self) -> &str {
+        &self.0
+    }
 }
 
-/// One error detail: a `code` drawn from the spec's closed vocabulary plus a human `message`.
-#[derive(Debug, Deserialize, Serialize)]
-pub struct ErrorDetail {
-    pub code: String,
-    pub message: String,
+impl Drop for Secret {
+    fn drop(&mut self) {
+        self.0.zeroize();
+    }
+}
+
+impl std::fmt::Debug for Secret {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("<redacted>")
+    }
+}
+
+impl From<&str> for Secret {
+    fn from(s: &str) -> Self {
+        Secret(s.to_string())
+    }
 }
 
 /// `GET /info` — mirrors `contract::InfoView`.
@@ -424,7 +513,7 @@ pub struct CreatedKeyView {
     #[serde(default)]
     pub created_at: u64,
     /// The busbar-signed token — shown exactly once.
-    pub token: String,
+    pub token: Secret,
     /// Unix-seconds expiry of the signed token.
     #[serde(default)]
     pub expires_at: u64,
@@ -434,7 +523,7 @@ pub struct CreatedKeyView {
     #[serde(default)]
     pub aws_access_key_id: Option<String>,
     #[serde(default)]
-    pub aws_secret_access_key: Option<String>,
+    pub aws_secret_access_key: Option<Secret>,
 }
 
 /// `POST /keys/{id}/rotate` response: metadata + the once-shown fresh credential — exactly one
@@ -456,11 +545,11 @@ pub struct RotatedKeyView {
     #[serde(default)]
     pub created_at: u64,
     #[serde(default)]
-    pub token: Option<String>,
+    pub token: Option<Secret>,
     #[serde(default)]
     pub expires_at: Option<u64>,
     #[serde(default)]
-    pub secret: Option<String>,
+    pub secret: Option<Secret>,
 }
 
 /// `POST /keys/{id}/revoke` response: the id, now durably denylisted.
@@ -480,8 +569,16 @@ pub struct PluginView {
     pub loader: String,
     #[serde(default)]
     pub active: Option<bool>,
+    /// For a dynamic-library plugin, its NAME — NOT a socket path or URL (that was the retired
+    /// 1.4.x transport target). `null` for a compiled-in row.
+    #[serde(default)]
+    pub target: Option<String>,
     #[serde(default)]
     pub file: Option<String>,
+    /// The C-ABI version the manifest declares — the operator-facing name for the ABI the engine
+    /// speaks. `null` for a compiled-in row or a plugin with no manifest.
+    #[serde(default)]
+    pub interface_version: Option<u32>,
     #[serde(default)]
     pub version: Option<String>,
     #[serde(default)]
@@ -519,6 +616,9 @@ pub struct InstallPluginReq {
 pub struct PluginInstallView {
     pub file: String,
     pub name: String,
+    /// The C-ABI version the installed manifest declares (see [`PluginView::interface_version`]).
+    #[serde(default)]
+    pub interface_version: Option<u32>,
     #[serde(default)]
     pub version: Option<String>,
     #[serde(default)]
@@ -595,8 +695,26 @@ pub struct HookView {
     pub on_error: String,
     #[serde(default)]
     pub timeout_ms: u64,
+    /// The KEY NAMES of the hook's opaque `settings:` bag, sorted, WITHOUT their values.
+    ///
+    /// This field USED to be the bag itself. A hook's settings bag is a secret-reference carrier
+    /// by design and a literal credential in it is fully supported, while `GET /hooks` is served
+    /// at READ-ONLY admin scope — so the gateway now projects key names only, and this client
+    /// models the redacted projection. Reading the bag verbatim is not something a newer gateway
+    /// will do, and this CLI must not model a shape that would invite it back.
+    #[serde(default)]
+    pub settings_keys: Vec<String>,
     #[serde(default)]
     pub global: bool,
+    /// The `phase:` stage list as configured (empty when unset; then `at:` or the core stages apply).
+    #[serde(default)]
+    pub phase: Vec<String>,
+    /// The stages the hook actually fires at, in pipeline order (the effective answer).
+    #[serde(default)]
+    pub fires_at: Vec<String>,
+    /// The `groups:` caller scope as configured; empty means every caller.
+    #[serde(default)]
+    pub groups: Vec<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -614,3 +732,50 @@ pub struct HookPage {
     #[serde(default)]
     pub next_cursor: Option<String>,
 }
+
+/// STRUCTURAL spec-contract check — the thing the `spec-drift` CI job could not see.
+///
+/// `spec-drift` compares `openapi.json`'s `info.version` against the latest busbar release, so it
+/// is blind to any shape change made under an UNCHANGED version stamp. That is not hypothetical:
+/// core `dev` and this repo's committed copy are both stamped 1.5.2 while core has already renamed
+/// the hook `settings` bag to `settings_keys` (a redaction fix) on `HookView`, `HookDesiredStatus`
+/// and `HookReportedStatus`, and added `drift_keys` to `HookStatusView`. A version-only check can
+/// never go red on that, and a check that cannot fail is not a check.
+///
+/// This module closes the gap by comparing the structs in this file against the SPEC DOCUMENT,
+/// field by field, in both directions:
+///
+///   * **no phantom fields** — every field this client models must exist in the schema. This is
+///     the anti-RENAME arm: `settings` → `settings_keys` goes red here.
+///   * **no ignored REQUIRED fields** — every field the schema marks `required` must be modelled,
+///     unless it is named in [`DELIBERATELY_UNRENDERED`] with a written reason. This is the
+///     anti-BLIND-SPOT arm: core adding a required field this CLI silently drops goes red, and the
+///     only way to quiet it is to record the decision.
+///
+/// The modelled field set is not a hand-maintained list — it is derived by SERIALIZING a real
+/// instance of each struct, so the table cannot drift away from the types it claims to describe.
+///
+/// **Which document.** By default the committed `openapi.json`. Set `BUSBAR_SPEC` to a path and
+/// the same assertions run against that document instead — which is how CI runs this, BLOCKING,
+/// against core at the run's branch. That paired run is consumption-scoped, so core racing ahead
+/// with new endpoints and new optional fields does NOT turn it red (the failure mode that forced
+/// the whole-document diff to be non-blocking); only a REMOVAL, a RENAME, or a new REQUIRED field
+/// this client ignores can fail it.
+#[cfg(test)]
+#[path = "spec_contract_tests.rs"]
+mod spec_contract_tests;
+
+#[cfg(test)]
+#[path = "spec_shape_tests.rs"]
+mod spec_shape_tests;
+
+/// Credential-echo canaries (CREDENTIAL-LOCKDOWN H1, H11). Each plants a known credential where
+/// the gateway would put a minted one and asserts it never reaches an error chain or a `Debug`
+/// rendering — the two places a CLI's output ends up in CI logs and bug reports.
+#[cfg(test)]
+#[path = "credential_echo_tests.rs"]
+mod credential_echo_tests;
+
+#[cfg(test)]
+#[path = "transport_tests.rs"]
+mod transport_tests;
