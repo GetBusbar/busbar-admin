@@ -31,6 +31,8 @@ jobs:
         run: cargo build --locked --verbose
       - name: test
         run: cargo test --locked --verbose
+      - name: Exact config JSON numbers
+        run: python3 scripts/tests/exact-json.py --cli target/debug/busbar-admin
       - name: Release and integration caller regressions
         run: |
           bash scripts/tests/release-upstream.sh
