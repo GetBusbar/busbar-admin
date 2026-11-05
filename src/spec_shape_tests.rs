@@ -143,3 +143,52 @@ fn inspect_view_tolerates_null_kind_and_absent_version() {
         Some("settings_schema is not valid JSON")
     );
 }
+
+#[test]
+fn info_view_preserves_process_identity_and_reads_older_servers() {
+    let base = serde_json::json!({
+        "version": "1.6.0", "build": {},
+        "topology": {"pools": 0, "models": 0, "providers": 0}
+    });
+    let old: InfoView = serde_json::from_value(base.clone()).expect("older info still decodes");
+    assert_eq!(old.process_boot_nonce, None);
+    let mut current = base;
+    let nonce = "0123456789abcdef0123456789abcdef";
+    current["process_boot_nonce"] = serde_json::json!(nonce);
+    let view: InfoView = serde_json::from_value(current).expect("process identity decodes");
+    assert_eq!(view.process_boot_nonce.as_deref(), Some(nonce));
+    assert_eq!(
+        serde_json::to_value(view).unwrap()["process_boot_nonce"],
+        nonce
+    );
+}
+
+#[test]
+fn plugin_readback_preserves_archive_identity_without_inventing_it() {
+    let digest = "a".repeat(64);
+    let plugin: PluginView = serde_json::from_value(serde_json::json!({
+        "name": "p", "type": "hook", "loader": "plugin", "archive_sha256": digest
+    }))
+    .unwrap();
+    assert_eq!(plugin.archive_sha256.as_deref(), Some(digest.as_str()));
+    assert_eq!(
+        serde_json::to_value(plugin).unwrap()["archive_sha256"],
+        digest
+    );
+    let old: PluginView =
+        serde_json::from_str(r#"{"name":"p","type":"hook","loader":"plugin"}"#).unwrap();
+    assert!(serde_json::to_value(old)
+        .unwrap()
+        .get("archive_sha256")
+        .is_none());
+    let inspected: InspectView = serde_json::from_value(serde_json::json!({
+        "name": "p", "trust": "trusted", "source": "installed_archive",
+        "file": "p.tar.gz", "archive_sha256": digest, "schema_state": "absent",
+        "schema": null, "schema_error": null
+    }))
+    .unwrap();
+    let wire = serde_json::to_value(inspected).unwrap();
+    assert_eq!(wire["file"], "p.tar.gz");
+    assert_eq!(wire["archive_sha256"], digest);
+    assert_eq!(wire["schema_state"], "absent");
+}

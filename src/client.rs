@@ -410,6 +410,9 @@ pub struct InfoView {
     pub uptime_seconds: Option<u64>,
     #[serde(default)]
     pub started_at: Option<u64>,
+    /// Opaque identity of this process, stable across reload and absent on older servers.
+    #[serde(default)]
+    pub process_boot_nonce: Option<String>,
     pub topology: TopologyInfo,
     #[serde(default)]
     pub config_persistence: bool,
@@ -575,6 +578,9 @@ pub struct PluginView {
     pub target: Option<String>,
     #[serde(default)]
     pub file: Option<String>,
+    /// SHA-256 of the complete installed archive bytes, when supplied by the server.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub archive_sha256: Option<String>,
     /// The C-ABI version the manifest declares — the operator-facing name for the ABI the engine
     /// speaks. `null` for a compiled-in row or a plugin with no manifest.
     #[serde(default)]
@@ -653,9 +659,16 @@ pub struct InspectView {
     pub kind: Option<String>,
     /// `trusted` | `unverified` | `rejected` (the plugin-catalog trust vocabulary).
     pub trust: String,
-    /// `describe` (a live hook answered) or `manifest`; for inspect it is always `manifest`.
+    /// Server-reported provenance: describe, statement, manifest, or installed_archive.
     #[serde(default)]
     pub source: String,
+    /// Explicit installed-archive lookup identity; absent on ordinary inspection/loaded reads.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub archive_sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schema_state: Option<String>,
     /// The kind-derived restart-scoping default; `null` when there is no resolvable manifest/kind.
     #[serde(default)]
     pub restart_required_default: Option<bool>,
