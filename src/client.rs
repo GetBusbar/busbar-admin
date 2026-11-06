@@ -703,9 +703,16 @@ pub struct HookView {
     #[serde(default)]
     pub priority: u16,
     #[serde(default)]
-    pub at: Option<String>,
-    #[serde(default)]
     pub on_error: String,
+    /// Authored empty-ranking policy; null preserves the omitted policy.
+    #[serde(default)]
+    pub on_empty: Option<String>,
+    /// Authored signal names, preserving their configured order.
+    #[serde(default)]
+    pub signals: Vec<String>,
+    /// Whether this hook is the configured default.
+    #[serde(default)]
+    pub default: bool,
     #[serde(default)]
     pub timeout_ms: u64,
     /// The KEY NAMES of the hook's opaque `settings:` bag, sorted, WITHOUT their values.
@@ -719,7 +726,7 @@ pub struct HookView {
     pub settings_keys: Vec<String>,
     #[serde(default)]
     pub global: bool,
-    /// The `phase:` stage list as configured (empty when unset; then `at:` or the core stages apply).
+    /// The `phase:` stage list as configured (empty selects the four fixed core stages).
     #[serde(default)]
     pub phase: Vec<String>,
     /// The stages the hook actually fires at, in pipeline order (the effective answer).
