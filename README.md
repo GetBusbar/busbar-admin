@@ -22,8 +22,8 @@ cargo install --path .
 # cargo install busbar-admin
 ```
 
-Prebuilt binaries and a Homebrew formula can follow via a tagged GitHub release (see
-`.github/workflows/release.yml`).
+Prebuilt binaries and Homebrew updates are published through the internal release pipeline.
+GitHub is a public source mirror; it runs no release workflow.
 
 ## Configuration
 
