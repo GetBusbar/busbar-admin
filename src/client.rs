@@ -87,7 +87,7 @@ impl Client {
         let mut tok = HeaderValue::from_str(token)
             .context("admin token contains characters invalid for an HTTP header")?;
         tok.set_sensitive(true);
-        headers.insert(X_ADMIN_TOKEN, tok.clone());
+        headers.insert(X_ADMIN_TOKEN, tok);
         // Send both carriers; the gateway accepts either.
         let mut bearer = HeaderValue::from_str(&Zeroizing::new(format!("Bearer {token}")))
             .context("admin token contains characters invalid for an HTTP header")?;
@@ -244,7 +244,7 @@ impl Client {
         let mut body = Zeroizing::new(Vec::new());
         resp.take(LIMIT + 1)
             .read_to_end(&mut body)
-            .map_err(|_| anyhow!("reading the gateway response body failed"))?;
+            .map_err(|e| anyhow!("reading the gateway response body failed ({})", e.kind()))?;
         anyhow::ensure!(
             body.len() as u64 <= LIMIT,
             "gateway response exceeds the 32 MiB limit"
