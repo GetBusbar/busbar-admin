@@ -390,3 +390,105 @@ fn failed_credential_write_retains_private_recovery_file() {
     );
     std::fs::remove_file(temporary).unwrap();
 }
+
+// ── allocation-free renderers vs. the String-building originals ──────────────────────────
+
+fn old_truncate(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        s.to_string()
+    } else {
+        let head: String = s.chars().take(max.saturating_sub(1)).collect();
+        format!("{head}…")
+    }
+}
+
+fn old_pools_summary(pools: &Option<Vec<String>>) -> String {
+    match pools {
+        None => "(all)".into(),
+        Some(p) if p.is_empty() => "(none)".into(),
+        Some(p) => old_truncate(&p.join(","), 12),
+    }
+}
+
+#[test]
+fn borrowed_cells_render_exactly_as_the_strings_they_replace() {
+    let texts = [
+        "",
+        "a",
+        "exactly-twenty-chars",
+        "twenty-one-characters",
+        "héllo wörld ünïcödé ñ and more",
+        "日本語のテキストはとても長いです本当に",
+        "日本語のテキストはとても長いです本当に長い",
+        "\u{1b}[31mred\u{7}",
+    ];
+    for t in texts {
+        for max in [0, 1, 12, 16, 20] {
+            assert_eq!(truncate(t, max).to_string(), old_truncate(t, max));
+            assert_eq!(
+                format!("[{:<20}]", truncate(t, max)),
+                format!("[{:<20}]", old_truncate(t, max))
+            );
+            assert_eq!(
+                format!("[{:>7}]", truncate(t, max)),
+                format!("[{:>7}]", old_truncate(t, max))
+            );
+        }
+    }
+    let pools = [
+        None,
+        Some(vec![]),
+        Some(vec!["a".to_string()]),
+        Some(vec!["pool-a".to_string(), "pool-b".to_string()]),
+        Some(vec!["abcdef".to_string(), "ghijk".to_string()]),
+        Some(vec!["abcdef".to_string(), "ghijkl".to_string()]),
+        Some(vec![
+            "ünï".to_string(),
+            "日本語".to_string(),
+            "x".to_string(),
+            "".to_string(),
+        ]),
+    ];
+    for p in &pools {
+        assert_eq!(
+            format!("[{:<12}]", pools_summary(p)),
+            format!("[{:<12}]", old_pools_summary(p))
+        );
+    }
+    for v in [None, Some(true), Some(false)] {
+        let old = v.map(|x| x.to_string()).unwrap_or_else(|| "-".into());
+        assert_eq!(format!("[{:<8}]", opt(v)), format!("[{old:<8}]"));
+    }
+}
+
+#[test]
+fn streamed_terminal_lines_match_escaping_the_formatted_line() {
+    for t in [
+        "plain",
+        "café",
+        "a\nb\r\u{1b}[2J\u{7}\u{0}\u{9b}z",
+        "",
+        "\u{7f}",
+    ] {
+        let mut out = Vec::new();
+        write_terminal_line(&mut out, format_args!("{:<12}|{t}|{}", t, 7)).unwrap();
+        let expected = format!("{}\n", terminal_text(&format!("{:<12}|{t}|{}", t, 7)));
+        assert_eq!(String::from_utf8(out).unwrap(), expected);
+    }
+}
+
+#[test]
+fn streamed_json_matches_the_pretty_string_it_replaces() {
+    let big: Vec<String> = (0..20_000).map(|i| format!("value-{i}")).collect();
+    let long = "x".repeat(3 * 64 * 1024);
+    for value in [
+        serde_json::json!({"a": 1}),
+        serde_json::json!({"items": big, "long": long, "n": 1.50}),
+        serde_json::to_value(created()).unwrap(),
+    ] {
+        let mut out = Vec::new();
+        write_json(&value, &mut out).unwrap();
+        let expected = format!("{}\n", serde_json::to_string_pretty(&value).unwrap());
+        assert_eq!(out, expected.as_bytes());
+    }
+}

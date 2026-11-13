@@ -17,7 +17,7 @@ use zeroize::{Zeroize, Zeroizing};
 
 use anyhow::{anyhow, Context, Result};
 use reqwest::blocking::{Client as HttpClient, RequestBuilder, Response};
-use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION};
+use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION, CONTENT_TYPE};
 use reqwest::{Method, StatusCode};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -29,7 +29,12 @@ pub(crate) fn read_local(
 ) -> Result<Zeroizing<Vec<u8>>> {
     let file =
         std::fs::File::open(path).with_context(|| format!("opening {label} {}", path.display()))?;
-    let mut bytes = Zeroizing::new(Vec::new());
+    // Size the buffer from the file's length up front: `Take` hides the size hint `File` would
+    // give `read_to_end`, so without this the Vec doubles its way up, copying the contents on each
+    // growth and leaving the pre-growth copies (a token file, a client key) un-zeroized in freed
+    // heap. Capped at `limit + 1` (the most `take` can yield); a length-less file (a pipe,
+    // `/dev/fd/N`) just falls back to growth.
+    let mut bytes = Zeroizing::new(Vec::with_capacity(size_hint(&file, limit + 1)));
     file.take(limit + 1)
         .read_to_end(&mut bytes)
         .with_context(|| format!("reading {label}"))?;
@@ -38,6 +43,104 @@ pub(crate) fn read_local(
         "{label} exceeds its {limit}-byte limit"
     );
     Ok(bytes)
+}
+
+/// The capacity to reserve for reading `file`: its length, capped at `cap`; 0 when unknown.
+fn size_hint(file: &std::fs::File, cap: u64) -> usize {
+    file.metadata()
+        .map_or(0, |m| m.len().min(cap))
+        .try_into()
+        .unwrap_or(0)
+}
+
+/// The proxy variables reqwest consults (via hyper-util's env matcher).
+const PROXY_ENV: [&str; 6] = [
+    "ALL_PROXY",
+    "all_proxy",
+    "HTTP_PROXY",
+    "http_proxy",
+    "HTTPS_PROXY",
+    "https_proxy",
+];
+
+/// Whether the client can be built without loading the platform's root store.
+///
+/// Loading the native roots is nearly the whole cost of a run (~170–770 ms on macOS, measured;
+/// the request itself is single-digit ms), yet a plain-`http` endpoint never handshakes: redirects
+/// are refused, so no request can hop to `https`. The one TLS session an `http` request could
+/// still need is to an `https://` proxy, so the roots are skipped only when no proxy variable is
+/// set at all. `--ca-cert` / `--insecure` / mTLS inputs are still read and validated as before.
+fn skip_built_in_roots(scheme: &str) -> bool {
+    scheme == "http" && PROXY_ENV.iter().all(|v| std::env::var_os(v).is_none())
+}
+
+/// Bytes of tarball read per base64 step: a multiple of 3, so no chunk but the last is padded.
+const UPLOAD_CHUNK: usize = 3 * 16 * 1024;
+
+/// Build the `POST /plugins` and `POST /plugins/inspect` body — `{"file":…,"tarball_b64":…}`,
+/// byte-identical to `serde_json::to_vec` of [`InstallPluginReq`] / [`InspectPluginReq`] (pinned
+/// by `transport_tests`) — by streaming the tarball through base64 straight into the body.
+///
+/// The serde route held the whole tarball, its base64 `String`, and then a second, growing copy
+/// of that string inside the JSON body: roughly 4–5x the tarball at peak. This reads a fixed
+/// chunk at a time into one exactly-sized body, so the peak is the body itself (4/3 of the
+/// tarball). Base64 output needs no JSON escaping, so the bytes are the same.
+///
+/// Errors keep the old order and wording: the open and read failures and the size limit are
+/// reported as `read_local` reports them, and only then a missing `file` name.
+pub(crate) fn plugin_upload_body(
+    tarball: &std::path::Path,
+    file: Option<&str>,
+    limit: u64,
+    label: &str,
+) -> Result<Vec<u8>> {
+    use base64::Engine as _;
+    const PREFIX: &[u8] = b"{\"file\":";
+    const MIDDLE: &[u8] = b",\"tarball_b64\":\"";
+    let reader = std::fs::File::open(tarball)
+        .with_context(|| format!("opening {label} {}", tarball.display()))?;
+    let name = file.unwrap_or("");
+    let encoded_hint = base64::encoded_len(size_hint(&reader, limit), true).unwrap_or(0);
+    // `name.len() + 2` is exact unless the name needs JSON escapes (then the Vec grows once).
+    let mut body =
+        Vec::with_capacity(PREFIX.len() + name.len() + 2 + MIDDLE.len() + encoded_hint + 2);
+    body.extend_from_slice(PREFIX);
+    serde_json::to_writer(&mut body, name).context("encoding the plugin file name")?;
+    body.extend_from_slice(MIDDLE);
+
+    let mut reader = reader.take(limit + 1);
+    let mut chunk = Zeroizing::new(vec![0u8; UPLOAD_CHUNK]);
+    let mut total: u64 = 0;
+    loop {
+        let mut filled = 0;
+        while filled < UPLOAD_CHUNK {
+            match reader.read(&mut chunk[filled..]) {
+                Ok(0) => break,
+                Ok(n) => filled += n,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(e) => return Err(e).with_context(|| format!("reading {label}")),
+            }
+        }
+        total += filled as u64;
+        anyhow::ensure!(total <= limit, "{label} exceeds its {limit}-byte limit");
+        if filled > 0 {
+            let start = body.len();
+            let encoded = base64::encoded_len(filled, true).context("plugin tarball too large")?;
+            body.resize(start + encoded, 0);
+            base64::engine::general_purpose::STANDARD
+                .encode_slice(&chunk[..filled], &mut body[start..])
+                .map_err(|_| anyhow!("encoding the plugin tarball"))?;
+        }
+        if filled < UPLOAD_CHUNK {
+            break;
+        }
+    }
+    body.extend_from_slice(b"\"}");
+    anyhow::ensure!(
+        file.is_some(),
+        "tarball path has no usable filename; pass --file"
+    );
+    Ok(body)
 }
 
 /// Header the admin plane authenticates on (the API also accepts `Authorization: Bearer <token>`).
@@ -115,8 +218,12 @@ impl Client {
         }
         match (&tls.client_cert, &tls.client_key) {
             (Some(cert), Some(key)) => {
-                let mut pem = read_local(cert, 1024 * 1024, "--client-cert")?;
+                let certpem = read_local(cert, 1024 * 1024, "--client-cert")?;
                 let keypem = read_local(key, 1024 * 1024, "--client-key")?;
+                // One exact allocation: appending to `certpem` would reallocate and could leave
+                // an un-zeroized copy of the private key behind in freed heap.
+                let mut pem = Zeroizing::new(Vec::with_capacity(certpem.len() + 1 + keypem.len()));
+                pem.extend_from_slice(&certpem);
                 pem.push(b'\n');
                 pem.extend_from_slice(&keypem);
                 let identity = reqwest::Identity::from_pem(&pem)
@@ -129,6 +236,10 @@ impl Client {
                     "--client-cert and --client-key must be provided together (mTLS)"
                 ))
             }
+        }
+
+        if skip_built_in_roots(parsed.scheme()) {
+            builder = builder.tls_built_in_root_certs(false);
         }
 
         let http = builder.build().context("building the HTTP client")?;
@@ -205,6 +316,23 @@ impl Client {
         Self::decode(resp)
     }
 
+    /// Send an already-encoded JSON body and decode into `T`. The request is the one
+    /// `RequestBuilder::json` would build (same `Content-Type`, same bytes) minus its re-encode.
+    fn send_json_body<T: DeserializeOwned>(
+        &self,
+        method: Method,
+        rel: &str,
+        body: Vec<u8>,
+    ) -> Result<T> {
+        let req = self
+            .http
+            .request(method, self.url(rel))
+            .header(CONTENT_TYPE, HeaderValue::from_static("application/json"))
+            .body(body);
+        let resp = self.execute(req)?;
+        Self::decode(resp)
+    }
+
     /// Send a request expecting NO body back (204). Returns Ok(()) on success.
     pub fn send_no_content(&self, method: Method, rel: &str) -> Result<()> {
         let req = self.http.request(method, self.url(rel));
@@ -241,7 +369,11 @@ impl Client {
             resp.content_length().is_none_or(|n| n <= LIMIT),
             "gateway response exceeds the 32 MiB limit"
         );
-        let mut body = Zeroizing::new(Vec::new());
+        // Reserve the advertised length (already capped at LIMIT above) so an honest response
+        // lands in one allocation: no doubling copies, and no un-zeroized pre-growth copies of a
+        // credential-bearing body left in freed heap. A chunked response falls back to growth.
+        let hint = resp.content_length().unwrap_or(0).try_into().unwrap_or(0);
+        let mut body = Zeroizing::new(Vec::with_capacity(hint));
         resp.take(LIMIT + 1)
             .read_to_end(&mut body)
             .map_err(|e| anyhow!("reading the gateway response body failed ({})", e.kind()))?;
@@ -317,16 +449,16 @@ impl Client {
 
     /// `POST /api/v1/admin/plugins` — install a signed plugin tarball (bytes ride as base64;
     /// the engine re-verifies the signed manifest server-side).
-    pub fn install_plugin(&self, req: &InstallPluginReq) -> Result<PluginInstallView> {
-        self.send(Method::POST, "/plugins", Some(req))
+    pub fn install_plugin(&self, body: Vec<u8>) -> Result<PluginInstallView> {
+        self.send_json_body(Method::POST, "/plugins", body)
     }
 
     /// `POST /api/v1/admin/plugins/inspect` — STATELESS preview of a candidate plugin tarball
     /// (bytes ride as base64). The engine verifies the signature and parses the manifest WITHOUT
     /// installing anything, returning the manifest's settings schema plus name/version/kind/trust.
     /// An untrusted/rejected candidate is reported (via `trust`), never refused.
-    pub fn inspect_plugin(&self, req: &InspectPluginReq) -> Result<InspectView> {
-        self.send(Method::POST, "/plugins/inspect", Some(req))
+    pub fn inspect_plugin(&self, body: Vec<u8>) -> Result<InspectView> {
+        self.send_json_body(Method::POST, "/plugins/inspect", body)
     }
 
     /// `POST /api/v1/admin/plugins/reload` — re-scan the plugins directory and return the
@@ -346,8 +478,8 @@ impl Client {
     }
 
     /// `POST /api/v1/admin/config/apply` — apply a full config carried in the body.
-    pub fn config_apply(&self, body: &serde_json::Value) -> Result<ConfigApplyView> {
-        self.send(Method::POST, "/config/apply", Some(body))
+    pub fn config_apply(&self, body: Vec<u8>) -> Result<ConfigApplyView> {
+        self.send_json_body(Method::POST, "/config/apply", body)
     }
 }
 
@@ -610,6 +742,12 @@ pub struct PluginPage {
 }
 
 /// `POST /plugins` request body: install a signed plugin tarball (bytes as base64).
+///
+/// The wire body is streamed by [`plugin_upload_body`] instead of serialized from this struct (a
+/// whole-tarball base64 `String` is the copy that path removes); this type stays the contract
+/// reference the spec tests audit, and `transport_tests` pins the streamed bytes to its
+/// `serde_json` encoding.
+#[cfg(test)]
 #[derive(Debug, Serialize)]
 pub struct InstallPluginReq {
     /// The bare `.tar.gz` filename to store the artifact under.
@@ -637,7 +775,9 @@ pub struct PluginInstallView {
 
 /// `POST /plugins/inspect` request body (`InspectPluginReq`): SAME shape as `InstallPluginReq`
 /// (`file` + `tarball_b64`). Inspect never writes to disk, so `file` is accepted only for shape
-/// parity with the install flow and is otherwise unused server-side.
+/// parity with the install flow and is otherwise unused server-side. Streamed on the wire by
+/// [`plugin_upload_body`], like [`InstallPluginReq`].
+#[cfg(test)]
 #[derive(Debug, Serialize)]
 pub struct InspectPluginReq {
     pub file: String,
