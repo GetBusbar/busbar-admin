@@ -7,7 +7,7 @@
 //! [`client`]; this module is the clap surface + human/JSON rendering.
 
 macro_rules! human_println {
-    ($($arg:tt)*) => { writeln!(&mut std::io::stdout().lock(), "{}", terminal_text(&format!($($arg)*)))? };
+    ($($arg:tt)*) => { write_terminal_line(&mut std::io::stdout().lock(), format_args!($($arg)*))? };
 }
 
 fn terminal_text(text: &str) -> String {
@@ -22,6 +22,46 @@ fn terminal_text(text: &str) -> String {
     output
 }
 
+/// Write `args` and a newline to `out`, escaping control characters exactly as [`terminal_text`]
+/// does — but streamed through the formatter, so a human line costs no `String` (the old
+/// `terminal_text(&format!(..))` built two per line). Escaping is per character, so escaping each
+/// formatter fragment is the same as escaping the formatted whole; the line still reaches stdout's
+/// `LineWriter` as one flush at the trailing newline.
+fn write_terminal_line(out: &mut dyn Write, args: std::fmt::Arguments<'_>) -> std::io::Result<()> {
+    struct Escaper<'a> {
+        out: &'a mut dyn Write,
+        error: Option<std::io::Error>,
+    }
+    impl Escaper<'_> {
+        fn put(&mut self, bytes: &[u8]) -> std::fmt::Result {
+            self.out.write_all(bytes).map_err(|e| {
+                self.error = Some(e);
+                std::fmt::Error
+            })
+        }
+    }
+    impl std::fmt::Write for Escaper<'_> {
+        fn write_str(&mut self, mut s: &str) -> std::fmt::Result {
+            while let Some((i, c)) = s.char_indices().find(|(_, c)| c.is_control()) {
+                self.put(&s.as_bytes()[..i])?;
+                for e in c.escape_default() {
+                    // `escape_default` of a control character yields ASCII only.
+                    self.put(&[e as u8])?;
+                }
+                s = &s[i + c.len_utf8()..];
+            }
+            self.put(s.as_bytes())
+        }
+    }
+    let mut escaper = Escaper { out, error: None };
+    if std::fmt::Write::write_fmt(&mut escaper, args).is_err() {
+        return Err(escaper
+            .error
+            .unwrap_or_else(|| std::io::Error::other("formatter error")));
+    }
+    escaper.out.write_all(b"\n")
+}
+
 mod client;
 
 use std::io::Write;
@@ -32,10 +72,7 @@ use anyhow::{Context, Result};
 use clap::parser::ValueSource;
 use clap::{Args, CommandFactory, FromArgMatches, Parser, Subcommand};
 
-use client::{
-    Client, CreateKeyReq, CreatedKeyView, InspectPluginReq, InstallPluginReq, KeyView, PluginView,
-    RotatedKeyView, Tls,
-};
+use client::{Client, CreateKeyReq, CreatedKeyView, KeyView, PluginView, RotatedKeyView, Tls};
 
 /// Resolve the three distinct `allowed_pools` states the server understands: omitted (`None`) =
 /// ALL pools; an explicit empty list (`--no-pools`) = NO pools; a non-empty list = exactly those.
@@ -356,10 +393,57 @@ fn print_json<T: serde::Serialize>(v: &T) -> Result<()> {
     write_json(v, &mut std::io::stdout().lock())
 }
 
+/// Pretty JSON plus a newline, streamed through a fixed zeroizing buffer rather than rendered to
+/// one whole `String` first: a large view (`config show`) no longer holds a full second copy of
+/// itself, and the buffer is wiped on drop as the old `Zeroizing<String>` was. Same bytes.
 fn write_json<T: serde::Serialize>(v: &T, out: &mut dyn Write) -> Result<()> {
-    let text = Zeroizing::new(serde_json::to_string_pretty(v)?);
-    writeln!(out, "{}", text.as_str())?;
+    let mut buffered = ZeroizingBufWriter::new(out);
+    serde_json::to_writer_pretty(&mut buffered, v).map_err(std::io::Error::from)?;
+    buffered.write_all(b"\n")?;
+    buffered.flush()?;
     Ok(())
+}
+
+/// A `BufWriter` whose buffer is zeroized on drop (rendered views can carry a credential).
+struct ZeroizingBufWriter<'a> {
+    out: &'a mut dyn Write,
+    buf: Zeroizing<Vec<u8>>,
+}
+
+impl<'a> ZeroizingBufWriter<'a> {
+    const CAPACITY: usize = 64 * 1024;
+
+    fn new(out: &'a mut dyn Write) -> Self {
+        Self {
+            out,
+            buf: Zeroizing::new(Vec::with_capacity(Self::CAPACITY)),
+        }
+    }
+
+    fn drain(&mut self) -> std::io::Result<()> {
+        let result = self.out.write_all(&self.buf);
+        self.buf.clear();
+        result
+    }
+}
+
+impl Write for ZeroizingBufWriter<'_> {
+    fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+        if self.buf.len() + data.len() > Self::CAPACITY {
+            self.drain()?;
+        }
+        if data.len() >= Self::CAPACITY {
+            self.out.write_all(data)?;
+        } else {
+            self.buf.extend_from_slice(data);
+        }
+        Ok(data.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.drain()?;
+        self.out.flush()
+    }
 }
 
 fn cmd_info(c: &Client, json: bool) -> Result<()> {
@@ -448,12 +532,34 @@ fn parse_labels(pairs: &[String]) -> Result<std::collections::BTreeMap<String, S
         .collect()
 }
 
-fn pools_summary(pools: &Option<Vec<String>>) -> String {
-    match pools {
-        None => "(all)".into(),
-        Some(p) if p.is_empty() => "(none)".into(),
-        Some(p) => truncate(&p.join(","), 12),
+/// The POOLS cell: `(all)`, `(none)`, or the comma-joined list cut to 12 characters — streamed
+/// over the list (no joined `String`).
+struct PoolsSummary<'a>(&'a Option<Vec<String>>);
+
+impl std::fmt::Display for PoolsSummary<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        const MAX: usize = 12;
+        let pools = match self.0 {
+            None => return f.pad("(all)"),
+            Some(p) if p.is_empty() => return f.pad("(none)"),
+            Some(p) => p,
+        };
+        let joined = || {
+            pools
+                .iter()
+                .enumerate()
+                .flat_map(|(i, p)| (i > 0).then_some(',').into_iter().chain(p.chars()))
+        };
+        if joined().nth(MAX).is_none() {
+            f.pad(Cell::whole(joined()).as_str())
+        } else {
+            f.pad(Cell::cut(joined(), MAX).as_str())
+        }
     }
+}
+
+fn pools_summary(pools: &Option<Vec<String>>) -> PoolsSummary<'_> {
+    PoolsSummary(pools)
 }
 
 fn cmd_keys_create(
@@ -642,12 +748,10 @@ fn render_created(
         p.write(created)?;
     }
     if json {
-        let text = Zeroizing::new(match secret_to.as_ref() {
-            None => serde_json::to_string_pretty(created)?,
-            Some(_) => serde_json::to_string_pretty(&json_without_secrets(created)?)?,
-        });
-        writeln!(out, "{}", text.as_str())?;
-        return Ok(());
+        return match secret_to.as_ref() {
+            None => write_json(created, out),
+            Some(_) => write_json(&json_without_secrets(created)?, out),
+        };
     }
     let shown = |v: &str| {
         Zeroizing::new(match secret_to.as_ref() {
@@ -745,12 +849,10 @@ fn render_rotated(
         p.write(rotated)?;
     }
     if json {
-        let text = Zeroizing::new(match secret_to.as_ref() {
-            None => serde_json::to_string_pretty(rotated)?,
-            Some(_) => serde_json::to_string_pretty(&json_without_secrets(rotated)?)?,
-        });
-        writeln!(out, "{}", text.as_str())?;
-        return Ok(());
+        return match secret_to.as_ref() {
+            None => write_json(rotated, out),
+            Some(_) => write_json(&json_without_secrets(rotated)?, out),
+        };
     }
     let shown = |v: &str| {
         Zeroizing::new(match secret_to.as_ref() {
@@ -851,27 +953,19 @@ fn print_plugin_rows(items: &[PluginView]) -> Result<()> {
     Ok(())
 }
 
+/// The streamed install/inspect body; `file` defaults to the tarball's basename.
+fn plugin_body(tarball: &Path, file: Option<&str>) -> Result<Vec<u8>> {
+    let file = file.or_else(|| tarball.file_name().and_then(|f| f.to_str()));
+    client::plugin_upload_body(tarball, file, 128 * 1024 * 1024, "plugin tarball")
+}
+
 fn cmd_plugins_install(
     c: &Client,
     tarball: &std::path::Path,
     file: Option<&str>,
     json: bool,
 ) -> Result<()> {
-    use base64::Engine as _;
-    let bytes = client::read_local(tarball, 128 * 1024 * 1024, "plugin tarball")?;
-    let file = match file {
-        Some(f) => f.to_string(),
-        None => tarball
-            .file_name()
-            .and_then(|f| f.to_str())
-            .context("tarball path has no usable filename; pass --file")?
-            .to_string(),
-    };
-    let req = InstallPluginReq {
-        file,
-        tarball_b64: base64::engine::general_purpose::STANDARD.encode(&bytes),
-    };
-    let installed = c.install_plugin(&req)?;
+    let installed = c.install_plugin(plugin_body(tarball, file)?)?;
     if json {
         return print_json(&installed);
     }
@@ -894,21 +988,7 @@ fn cmd_plugins_inspect(
     file: Option<&str>,
     json: bool,
 ) -> Result<()> {
-    use base64::Engine as _;
-    let bytes = client::read_local(tarball, 128 * 1024 * 1024, "plugin tarball")?;
-    let file = match file {
-        Some(f) => f.to_string(),
-        None => tarball
-            .file_name()
-            .and_then(|f| f.to_str())
-            .context("tarball path has no usable filename; pass --file")?
-            .to_string(),
-    };
-    let req = InspectPluginReq {
-        file,
-        tarball_b64: base64::engine::general_purpose::STANDARD.encode(&bytes),
-    };
-    let preview = c.inspect_plugin(&req)?;
+    let preview = c.inspect_plugin(plugin_body(tarball, file)?)?;
     if json {
         return print_json(&preview);
     }
@@ -1022,9 +1102,16 @@ fn cmd_config_apply(c: &Client, file: &std::path::Path, json: bool) -> Result<()
     let raw = client::read_local(file, 32 * 1024 * 1024, "config file")?;
     let mut body: serde_json::Value = serde_json::from_slice(&raw)
         .with_context(|| format!("parsing {} as JSON", file.display()))?;
-    let result = c.config_apply(&body);
+    // Encode exactly what `RequestBuilder::json` would (compact `serde_json`), sized from the
+    // file — a compact re-encode is never much larger than its source — then wipe and free the
+    // source and the parsed tree BEFORE the round trip instead of holding all three across it.
+    let mut encoded = Vec::with_capacity(raw.len());
+    drop(raw);
+    let encoded_result = serde_json::to_writer(&mut encoded, &body);
     wipe_json(&mut body);
-    let resp = result?;
+    drop(body);
+    encoded_result.context("encoding the config body")?;
+    let resp = c.config_apply(encoded)?;
     if json {
         print_json(&resp)?;
     }
@@ -1058,17 +1145,77 @@ fn cmd_config_apply(c: &Client, file: &std::path::Path, json: bool) -> Result<()
 
 // ── small render helpers ─────────────────────────────────────────────────────────────────────
 
-fn opt<T: std::fmt::Display>(v: Option<T>) -> String {
-    v.map(|x| x.to_string()).unwrap_or_else(|| "-".into())
+/// `v` rendered, or `-` when absent — a borrowed `Display` (no per-cell `String`). The value's
+/// own `Display` applies the caller's width/alignment, as the `String` it replaces did.
+struct Opt<T>(Option<T>);
+
+impl<T: std::fmt::Display> std::fmt::Display for Opt<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.0 {
+            Some(v) => v.fmt(f),
+            None => f.pad("-"),
+        }
+    }
 }
 
-fn truncate(s: &str, max: usize) -> String {
-    if s.chars().count() <= max {
-        s.to_string()
-    } else {
-        let head: String = s.chars().take(max.saturating_sub(1)).collect();
-        format!("{head}…")
+fn opt<T: std::fmt::Display>(v: Option<T>) -> Opt<T> {
+    Opt(v)
+}
+
+/// The longest cell [`Cell`] is asked to cut to; bounds its stack buffer (4 bytes per char).
+const MAX_CELL_CHARS: usize = 32;
+
+/// A table cell cut to at most `max` characters, the last an ellipsis when cut — rendered on the
+/// stack so a row costs no allocation. Width/alignment apply to the cut text via `pad`.
+struct Cell {
+    buf: [u8; MAX_CELL_CHARS * 4],
+    len: usize,
+}
+
+impl Cell {
+    /// The characters of `chars`, which the caller knows number at most [`MAX_CELL_CHARS`].
+    fn whole(chars: impl Iterator<Item = char>) -> Self {
+        let mut cell = Self {
+            buf: [0; MAX_CELL_CHARS * 4],
+            len: 0,
+        };
+        for c in chars.take(MAX_CELL_CHARS) {
+            cell.len += c.encode_utf8(&mut cell.buf[cell.len..]).len();
+        }
+        cell
     }
+
+    /// Cut the character stream `chars` (already known to exceed `max`) to `max` characters.
+    fn cut(chars: impl Iterator<Item = char>, max: usize) -> Self {
+        let keep = max.min(MAX_CELL_CHARS).saturating_sub(1);
+        Self::whole(chars.take(keep).chain(std::iter::once('…')))
+    }
+
+    fn as_str(&self) -> &str {
+        // Only whole encoded characters are ever appended.
+        std::str::from_utf8(&self.buf[..self.len]).unwrap_or_default()
+    }
+}
+
+/// `s` cut to at most `max` characters (see [`Cell`]); borrowed when it already fits.
+struct Truncated<'a> {
+    s: &'a str,
+    max: usize,
+}
+
+impl std::fmt::Display for Truncated<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.s.chars().nth(self.max).is_none() {
+            f.pad(self.s)
+        } else {
+            f.pad(Cell::cut(self.s.chars(), self.max).as_str())
+        }
+    }
+}
+
+fn truncate(s: &str, max: usize) -> Truncated<'_> {
+    debug_assert!(max <= MAX_CELL_CHARS);
+    Truncated { s, max }
 }
 
 fn human_duration(secs: u64) -> String {
